@@ -28,7 +28,16 @@
 //  其余四项只统计不改：它们要么是用户数据（孤儿引用、过期订阅日），
 //  要么需要人来判断意图（非法日、负金额），静默改写比留痕危险得多。
 //
-//  性能预算：全表扫（≤1 万行 + 订阅表）< 30ms。
+//  性能预算（实测 iPhone 17 Pro 模拟器 / iOS 26.5，2026-11）：全表扫 ≈17-20µs/行 ——
+//  2 000 行 ≈41ms（39.5-45.6ms），1 万行 ≈200ms（201.0 / 204.2ms 两轮）。
+//
+//  这笔钱里 **~85% 是 SwiftData 逐行 materialize**（2 000 行 ~35ms），与行数线性、
+//  与缓存冷热无关 —— 同一个 context 连跑三次 fetch 都是 30-35ms，而空谓词 fetch 只要
+//  0.3ms。我们自己的逐条扫（`scan`）2 000 行只要 2-6ms。
+//
+//  所以任何"全表扫 < 30ms"的说法都是错的（旧版本这里写的正是 30ms）。两条测试各守一层：
+//  `testScanTwoThousandEntriesUnder30Milliseconds` 盯 `scan` 的复杂度，
+//  `testDetectTwoThousandEntriesUnderCoarseBudget`（300ms）只防量级事故。
 //
 
 import Foundation
@@ -130,6 +139,38 @@ enum Diagnostics {
         }
     }
 
+    // MARK: - 逐条扫的输入 / 输出（值类型投影）
+
+    /// `detect` 逐条扫用到的字段投影。
+    ///
+    /// 存在的唯一理由：`detect` 的耗时被 SwiftData 的逐行 materialize 淹掉了
+    /// （2 000 行约 35ms，≈17µs/行，与行数线性、与缓存冷热无关），
+    /// 想在测试里盯「我们自己写的那部分逻辑有没有退化」就必须能脱离 context 跑。
+    ///
+    /// 关系字段在这里被压成 `hasCategory` / `hasAccount` 两个 `Bool` ——
+    /// fault 就发生在构造这个投影的那一刻（`entry.category != nil`），
+    /// 总代价与原先在循环里懒访问完全一致，只是把"读库"和"算"分成了两步。
+    struct EntrySnapshot: Sendable {
+        var id: UUID
+        var sourceCycleUniqueKey: String?
+        var deletedAt: Date?
+        var createdAt: Date
+        var isTransfer: Bool
+        var hasCategory: Bool
+        var hasAccount: Bool
+        var occurredDay: Int32
+        var amount: Int64
+    }
+
+    /// 逐条扫描的结果（①①b②③④ 的产出，不含 ⑤ 订阅）。
+    struct ScanResult: Sendable {
+        var duplicateUniqueKeyEntries: [String: [UUID]] = [:]
+        var duplicateLiveEntries: [String: [UUID]] = [:]
+        var orphanReferenceCount: Int = 0
+        var invalidDayCount: Int = 0
+        var negativeAmountCount: Int = 0
+    }
+
     // MARK: - 入口
 
     /// 完整自检 + （DEBUG）自动修。**Release 只检测不修改**。
@@ -170,66 +211,88 @@ enum Diagnostics {
         let entries = try context.fetch(QueryDescriptors.allEntries())
         let subscriptions = try context.fetch(QueryDescriptors.allSubscriptions())
 
-        // ① 重复幂等键：按 createdAt 升序分组，第一条保留
-        //    `allEntries()` 已按 occurredDay 排序，这里再按 createdAt 排一次保证"最早者优先"
-        var grouped: [String: [LedgerEntry]] = [:]
-        for entry in entries {
-            guard let key = entry.sourceCycleUniqueKey, !key.isEmpty else { continue }
-            grouped[key, default: []].append(entry)
-        }
-        var duplicateIDs: [String: [UUID]] = [:]
-        for (key, bucket) in grouped where bucket.count > 1 {
-            let ordered = bucket.sorted { lhs, rhs in
-                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
-                return lhs.id.uuidString < rhs.id.uuidString
-            }
-            duplicateIDs[key] = ordered.map(\.id)
-        }
-
-        // ①b 同一批里"仍然有效"的重复（修复只可能消掉这一种）
-        var liveGrouped: [String: [UUID]] = [:]
-        for entry in entries {
-            guard let key = entry.sourceCycleUniqueKey, !key.isEmpty, entry.deletedAt == nil else {
-                continue
-            }
-            liveGrouped[key, default: []].append(entry.id)
-        }
-        let liveDuplicates = liveGrouped.filter { $0.value.count > 1 }
-
-        // ②③④ 逐条检查
-        var orphanCount = 0
-        var invalidDayCount = 0
-        var negativeCount = 0
-
-        for entry in entries {
-            // 转账没有分类是设计使然（PRD 3.2.1），不算孤儿
-            if !entry.isTransfer, entry.category == nil || entry.account == nil {
-                orphanCount += 1
-            }
-            if entry.occurredDay == 0 || entry.occurredDay > today.key {
-                invalidDayCount += 1
-            }
-            if entry.amount < 0 {
-                negativeCount += 1
-            }
-        }
+        // ①①b②③④ 全部在 `scan` 里做。这里先投影：**fault 只在这一步发生**，
+        // 之后就是纯值类型运算，可脱离 context 单独测（见 `ScanResult` 的说明）。
+        let snapshots = entries.map(EntrySnapshot.init)
+        let scanned = scan(snapshots, today: today)
 
         // ⑤ 状态 active、有下次扣费日、却停在过去的订阅
         //    （D21：扫描推进日期时漏了尾巴，用户会永远收不到新账目）
+        //    没有搬进 `scan`：它查的是另一张表，跟逐条扫的代价无关。
         let staleSubscriptionIDs = subscriptions
             .filter { $0.status == .active && $0.nextBillingDay > 0 && $0.nextBillingDay < today.key }
             .map(\.id)
 
         return Report(
-            modelCount: SchemaV1.models.count,
-            duplicateUniqueKeyEntries: duplicateIDs,
-            duplicateLiveEntries: liveDuplicates,
-            orphanReferenceCount: orphanCount,
-            invalidDayCount: invalidDayCount,
-            negativeAmountCount: negativeCount,
+            // V1.1：容器已迁到 `SchemaV2`（7 个模型，含 `EntryTemplate`），自检口径必须跟着走，
+            // 否则报告里的模型数会永远停在 6，结构自检形同虚设。
+            modelCount: SchemaV2.models.count,
+            duplicateUniqueKeyEntries: scanned.duplicateUniqueKeyEntries,
+            duplicateLiveEntries: scanned.duplicateLiveEntries,
+            orphanReferenceCount: scanned.orphanReferenceCount,
+            invalidDayCount: scanned.invalidDayCount,
+            negativeAmountCount: scanned.negativeAmountCount,
             staleSubscriptionIDs: staleSubscriptionIDs,
             durationMilliseconds: Date().timeIntervalSince(started) * 1_000
         )
+    }
+
+    // MARK: - 逐条扫（纯函数，可脱离 ModelContext 测）
+
+    /// ①①b②③④ 五项检查的全部逻辑。
+    ///
+    /// **纯函数**：不碰 `ModelContext`、不读写任何 `@Model`，只吃值类型。
+    /// 拆出来的目的不是复用，是**可测** —— 原先这几十行和 `fetch` 粘在同一个函数里，
+    /// 想量它的耗时，量到的 95% 是 SwiftData 逐行 materialize 的成本（≈17µs/行）。
+    ///
+    /// - Parameters:
+    ///   - snapshots: 账目的字段投影，顺序即为 `allEntries()` 的顺序。
+    ///   - today: "今天"，用于判非法日（未来日期）。
+    /// - Returns: 四项计数的汇总（第五项订阅不在本函数职责内）。
+    static func scan(_ snapshots: [EntrySnapshot], today: DateOnly) -> ScanResult {
+        var result = ScanResult()
+
+        // ① 重复幂等键：按 createdAt 升序分组，第一条保留
+        var grouped: [String: [EntrySnapshot]] = [:]
+        for snapshot in snapshots {
+            guard let key = snapshot.sourceCycleUniqueKey, !key.isEmpty else { continue }
+            grouped[key, default: []].append(snapshot)
+        }
+        for (key, bucket) in grouped where bucket.count > 1 {
+            let ordered = bucket.sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt { return lhs.createdAt < rhs.createdAt }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
+            result.duplicateUniqueKeyEntries[key] = ordered.map(\.id)
+        }
+
+        // ①b 同一批里"仍然有效"的重复（修复只可能消掉这一种）
+        //     id 数组保持 `snapshots` 的原始顺序 —— 这一份只用于"有哪些键重了"，
+        //     与①的"谁该保留"无关，别顺手给它加排序。
+        var liveGrouped: [String: [UUID]] = [:]
+        for snapshot in snapshots {
+            guard let key = snapshot.sourceCycleUniqueKey, !key.isEmpty, snapshot.deletedAt == nil else {
+                continue
+            }
+            liveGrouped[key, default: []].append(snapshot.id)
+        }
+        result.duplicateLiveEntries = liveGrouped.filter { $0.value.count > 1 }
+
+        // ②③④ 逐条检查
+        for snapshot in snapshots {
+            // 转账没有分类是设计使然（PRD 3.2.1），不算孤儿
+            if !snapshot.isTransfer, !snapshot.hasCategory || !snapshot.hasAccount {
+                result.orphanReferenceCount += 1
+            }
+            if snapshot.occurredDay == 0 || snapshot.occurredDay > today.key {
+                result.invalidDayCount += 1
+            }
+            if snapshot.amount < 0 {
+                result.negativeAmountCount += 1
+            }
+        }
+
+        return result
     }
 
     // MARK: - 修复（显式、可测、只在 DEBUG 被 `run` 调用）
@@ -259,14 +322,17 @@ enum Diagnostics {
 
         var repaired = 0
         let now = Date()
+        // 复用 `LedgerWriter` 的软删除唯一入口（V1.1 风险 R1）：`deletedAt` 与 `deletedDay`
+        // 两列必须同进同出。这里有 `ModelContext` 但不持有主写入器，因此就地造一个
+        // "只带 context 的 writer" —— 它不新增事务边界，只是把两列的写入收敛回同一段代码。
+        let writer = LedgerWriter(context: context)
         for id in uniqueStaleIDs {
             guard let entry = try? context.fetch(
                 FetchDescriptor<LedgerEntry>(predicate: #Predicate { $0.id == id })
             ).first else { continue }
             // 已经软删的不重复计数
             guard entry.deletedAt == nil else { continue }
-            entry.deletedAt = now
-            entry.updatedAt = now
+            try writer.markDeleted(entry, at: now)
             repaired += 1
         }
 
@@ -290,7 +356,7 @@ enum Diagnostics {
         try detect(in: context).duplicateUniqueKeyEntries
     }
 
-    /// 结构自检：回报 schema 里的模型数量（验证六个模型都注册进 `SchemaV1`）。
+    /// 结构自检：回报 schema 里的模型数量（验证 V1.1 的七个模型都注册进 `SchemaV2`）。
     ///
     /// - Parameter schema: 待检查的 schema。
     static func check(schema: Schema) -> Report {
@@ -301,5 +367,31 @@ enum Diagnostics {
     @MainActor
     static func check(container: ModelContainer) throws -> Report {
         try detect(in: ModelContext(container))
+    }
+}
+
+// MARK: - 从 @Model 构造投影
+
+extension Diagnostics.EntrySnapshot {
+
+    /// 从一条账目拍下投影。
+    ///
+    /// 放在 extension 里而不是结构体体内，是为了**保住编译器合成的逐成员初始化器** ——
+    /// 测试要能直接构造投影而不碰 SwiftData，那就是它存在的意义。
+    ///
+    /// `entry.category` / `entry.account` 的 fault 发生在这一行；与原先在检查循环里
+    /// 懒访问相比，总代价一样，只是时机提前了（fetch → 投影 → 纯计算）。
+    init(_ entry: LedgerEntry) {
+        self.init(
+            id: entry.id,
+            sourceCycleUniqueKey: entry.sourceCycleUniqueKey,
+            deletedAt: entry.deletedAt,
+            createdAt: entry.createdAt,
+            isTransfer: entry.isTransfer,
+            hasCategory: entry.category != nil,
+            hasAccount: entry.account != nil,
+            occurredDay: entry.occurredDay,
+            amount: entry.amount
+        )
     }
 }

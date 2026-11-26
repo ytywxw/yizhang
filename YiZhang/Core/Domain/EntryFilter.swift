@@ -39,6 +39,12 @@ protocol EntryFilterTarget {
     var accountIDs: Set<UUID> { get }
     /// 备注。
     var note: String { get }
+    /// 是否「待确认」（V1.1 F-SUB-13）。
+    ///
+    /// 放在协议上而不是在 `matches` 里对 `source == .subscription` 反推：
+    /// "待确认"是账目自身的一个状态，不是来源的推论——将来若出现别的待确认来源
+    /// （例如导入的账单），筛选逻辑不需要改一个字。
+    var isPending: Bool { get }
 }
 
 // MARK: - 筛选条件
@@ -90,6 +96,8 @@ struct EntryFilter: Hashable, Sendable {
     var sources: Set<EntrySource> = []
     /// 关键词（对备注做不区分大小写的包含匹配）。
     var keyword: String = ""
+    /// 只看「待确认」（V1.1 F-SUB-13 的第七个维度）。
+    var pendingOnly: Bool = false
 
     /// 空条件（不筛选）。
     static let none = EntryFilter()
@@ -111,6 +119,7 @@ struct EntryFilter: Hashable, Sendable {
             || !accountIDs.isEmpty
             || !sources.isEmpty
             || !trimmedKeyword.isEmpty
+            || pendingOnly
     }
 
     /// 生效的维度数量（顶部 chips 的"筛选 (3)"用）。
@@ -122,6 +131,7 @@ struct EntryFilter: Hashable, Sendable {
         if !accountIDs.isEmpty { count += 1 }
         if !sources.isEmpty { count += 1 }
         if !trimmedKeyword.isEmpty { count += 1 }
+        if pendingOnly { count += 1 }
         return count
     }
 
@@ -171,6 +181,10 @@ struct EntryFilter: Hashable, Sendable {
         }
         let needle = trimmedKeyword
         if !needle.isEmpty, !target.note.localizedStandardContains(needle) {
+            return false
+        }
+        // 第七维：只看待确认。与其他维度之间同样是 AND。
+        if pendingOnly, !target.isPending {
             return false
         }
         return true
@@ -234,11 +248,18 @@ struct EntryFilter: Hashable, Sendable {
             result.append(Chip(id: EntryFilter.chipIDKeyword, title: "“\(trimmedKeyword)”"))
         }
 
+        if pendingOnly {
+            result.append(Chip(id: EntryFilter.chipIDPending, title: EntryFilter.pendingChipTitle))
+        }
+
         return result
     }
 
     static let chipIDTime = "time"
     static let chipIDKeyword = "keyword"
+    static let chipIDPending = "pending"
+    /// 「待确认」chip 的文案（面板与 chips 行共用一份，避免两处措辞不一致）。
+    static let pendingChipTitle = "待确认"
 
     /// 时间 chip 的文案（自定义区间带上日期）。
     private var timeChipTitle: String {
@@ -267,6 +288,10 @@ struct EntryFilter: Hashable, Sendable {
         }
         if id == EntryFilter.chipIDKeyword {
             keyword = ""
+            return
+        }
+        if id == EntryFilter.chipIDPending {
+            pendingOnly = false
             return
         }
         if id.hasPrefix("type:") {
@@ -299,6 +324,9 @@ struct EntryFilter: Hashable, Sendable {
     }
 
     /// 清空全部条件（「清除全部」）。
+    ///
+    /// 整体重置而不是逐字段归零：新增维度（如 `pendingOnly`）时这里**不需要**同步改，
+    /// 少一个"容易忘"的地方。
     mutating func clearAll() {
         self = EntryFilter()
     }

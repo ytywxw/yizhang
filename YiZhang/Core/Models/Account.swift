@@ -59,6 +59,13 @@ final class Account {
     @Relationship(deleteRule: .nullify, inverse: \Todo.account)
     var todos: [Todo]? = []
 
+    /// 以本账户为预设账户的记账模板（V1.1 F-ACC-14）。
+    ///
+    /// 与 `Category.templates` 对称：显式 `inverse:` + `.nullify`，两侧 deleteRule 必须一致。
+    /// 账户被删除时模板保留（账户字段置空），归档则由 UI 逐字段降级（PRD 5.3-4）。
+    @Relationship(deleteRule: .nullify, inverse: \EntryTemplate.account)
+    var templates: [EntryTemplate]? = []
+
     // MARK: - 初始化
 
     init() {}

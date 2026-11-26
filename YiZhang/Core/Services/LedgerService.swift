@@ -143,6 +143,18 @@ final class LedgerService {
     /// 也让 Service 可以在测试里独立构造（回调留空即可）。
     var onDidCommit: (() -> Void)?
 
+    /// **软删之后**的清理钩子（V1.1，由 `AppEnvironment` 接到 `TrashService.purgeExpired`）。
+    ///
+    /// 为什么是闭包而不是注入 `TrashService`：`TrashService` 已经强依赖
+    /// `SubscriptionService`（恢复时要 `unsuppress`），如果各 Service 再反向强引用
+    /// `TrashService`，对象图里就出现环（ARC 下不会崩，但两边都永远不释放）。
+    /// 闭包把依赖方向固定成单向，本类也不必知道"回收站"这个概念。
+    ///
+    /// 调用时机是**提交之后**，不是提交之前：清理要删的是"已经软删满 30 天"的记录，
+    /// 它必须先看到刚刚这次软删已经落库。钩子内部自行 `try?`，本类不关心成败——
+    /// 清理失败最多让过期项多留一会儿，绝不能因此把用户的删除动作回滚掉。
+    var onDidSoftDelete: (() -> Void)?
+
     /// "今天"的来源（`validateDay` 用它判断未来日期）。
     ///
     /// 为什么是闭包而不是一个存下来的 `DateOnly`：
@@ -255,6 +267,9 @@ final class LedgerService {
         let moment = Date()
         guard let snapshot = try? writer.softDelete(id: id, at: moment) else { return nil }
         onDidCommit?()
+        // 软删之后的回收站清理（PRD 6.2 的第二个挂载点）。放在 `onDidCommit` 之后：
+        // 先广播让界面看到"少了一笔"，再去清理过期的旧记录，两件事互不依赖。
+        onDidSoftDelete?()
         return UndoToken(entryID: snapshot.id, deletedAt: moment, snapshot: snapshot)
     }
 
@@ -289,6 +304,103 @@ final class LedgerService {
     // T14 会在这里加 `deleteSubscriptionEntry(_:mode:)`：
     // A 分支 = 软删 + 该周期写入 suppressedCycles（日期不回退）；
     // B 分支 = **硬删** + nextBillingDay 回退 + 锚定日重置（R8：B 分支软删会导致账目永不重生）。
+
+    // MARK: - 待确认（V1.1 F-SUB-13）
+    //
+    // 只做"确认"这一侧。**"不是这笔"（否定）不在这里**：否定的实现需要软删 + 抑制订阅周期，
+    // 而抑制周期意味着要持有 `SubscriptionService`，`LedgerService` 与 `SubscriptionService`
+    // 之间已经存在 ledger → subscription 的构造关系（`SubscriptionService(writer:ledger:)`），
+    // 反向注入就是环。所以否定放在 `SubscriptionService.denyEntry(id:)`。
+
+    /// 确认某一笔待确认账目（`pending` → `confirmed`）。
+    ///
+    /// 三条刻意的行为：
+    /// ① **只看状态，不做业务推断**：不是 pending 就返回 `false`，不报错、不写库、不广播。
+    ///    幂等在这里不是"优化"而是语义——首页行动条上的"全部确认"与用户连点两次
+    ///    都会重复调用同一个 id，第二次响一声"操作失败"是错的；
+    /// ② **不改金额、不改任何其它字段**：用户点的是"这笔账是对的"，不是"以我说的为准"。
+    ///    顺手刷新 `updatedAt`，让导出/同步能看出这一笔被核对过；
+    /// ③ 只有真的写成功才广播 `onDidCommit`——空转广播会让首页列表无谓地重建。
+    ///
+    /// - Parameter id: 账目 id。
+    /// - Returns: 是否真的从 pending 变成了 confirmed。
+    @discardableResult
+    func confirm(id: UUID) throws -> Bool {
+        guard let entry = try writer.entry(id: id), entry.isPending else { return false }
+        // 走 `writer.update(id:)` 而不是自己写 context：`updatedAt` 与 `save()` 由唯一写入口负责
+        let updated = try writer.update(id: id) { model in
+            model.confirmation = .confirmed
+        }
+        guard updated != nil else { return false }
+        onDidCommit?()
+        return true
+    }
+
+    /// 待确认账目的笔数与金额合计（首页「含待确认 N 笔」用）。
+    ///
+    /// 口径说明（PRD 2.3-1）：**pending 计入一切统计**，这里的金额只是"其中有多少还没核对"，
+    /// 它不是"要减掉的金额"。所以首页大数字不因为它变化（Q1）。
+    ///
+    /// 为什么只扫订阅来源的账目：`pending` 的唯一产生点是 `validated` 的第 ⑥ 步，
+    /// 而那里只有 `source == .subscription` 才可能给出 `.pending`
+    /// （手动 / 待办恒为 confirmed）。于是"扫订阅来源"与"扫全表"结果相同，
+    /// 但代价从"全库账目"降到"订阅账目"——首页每次 `load()` 都会调它。
+    /// 恢复逻辑（`TrashService.restore`）写回快照时不会改变来源，这个前提始终成立。
+    ///
+    /// - Returns: `(笔数, 金额合计)`。没有待确认账目时返回 `(0, .zero)`。
+    func pendingSummary() throws -> (count: Int, amount: Money) {
+        let pending = try pendingEntries()
+        var cents: Int64 = 0
+        for entry in pending {
+            cents += entry.amount
+        }
+        return (pending.count, Money(cents: cents))
+    }
+
+    /// 确认全部待确认账目（首页行动条 / 待确认页的「全部确认」）。
+    ///
+    /// **一次 `save()` + 一条 `onDidCommit`**：20 笔待确认如果逐笔 `confirm`，
+    /// 就是 20 次 SQLite 事务 + 20 次列表重建，用户会看到列表闪烁十几下。
+    /// 一次事务还保证了"要么全确认、要么全不动"——中途失败不会留下半批状态。
+    ///
+    /// 写法照抄项目既有的批量范式（`SweepCoordinator.applyBatch`）：逐笔
+    /// `writer.update(model, save: false)` 改字段，最后一次 `writer.save()` 提交。
+    /// 不用 `writer.update(id:)` 是因为它内部会自己写 `updatedAt` 并逐笔 `save()`，
+    /// 那样这两个"一批一次"的保证都不成立；属性赋值也仍然发生在 `writer` 的闭包内（A3）。
+    ///
+    /// - Returns: 实际确认的笔数。
+    @discardableResult
+    func confirmAll() throws -> Int {
+        let pending = try pendingEntries()
+        guard !pending.isEmpty else { return 0 }
+
+        let now = Date()
+        for entry in pending {
+            try writer.update(entry, save: false) { model in
+                model.confirmRaw = EntryConfirmation.confirmed.raw
+                model.updatedAt = now
+            }
+        }
+        try writer.save()
+        onDidCommit?()
+        return pending.count
+    }
+
+    /// 当前所有待确认、且未被软删的账目（按应扣日倒序，最近的排在前面）。
+    ///
+    /// 排序在内存里做：`QueryDescriptors` 的订阅来源描述符已按 `occurredDay` 正序返回，
+    /// 这里反转即可，不需要第二个 desc（`QueryDescriptors` 本批零改动）。
+    ///
+    /// 为什么对外可见（而不是只给 `pendingSummary` / `confirmAll` 用）：
+    /// 核对页（`PendingReviewView`）要逐笔展示"哪几笔还没核对"，与统计口径必须同源。
+    /// 若让视图自己查一遍，界面上的笔数和「全部确认」实际确认的笔数会在
+    /// "刚被别的页面确认掉一笔"这种时刻对不上——同一个筛选逻辑只能有一份。
+    func pendingEntries() throws -> [LedgerEntry] {
+        let entries = try writer.fetch(QueryDescriptors.entries(ofSource: .subscription))
+        return entries
+            .filter { $0.isPending && !$0.isDeleted }
+            .sorted { $0.occurredDay > $1.occurredDay }
+    }
 
     // MARK: - 查询
 
@@ -405,6 +517,29 @@ final class LedgerService {
                         cycleKey: cycleKey
                     )
                 }
+            }
+        }
+
+        // ⑥ 确认状态（V1.1 F-SUB-13）
+        //
+        // **只在调用方没给值时判定**：显式传入的 `confirmRaw` 必须原样保留。
+        // 这条 "if" 不是防御性代码，而是契约——`EntryDraft.confirmRaw` 的文档写明
+        // "nil = 由业务层判定"，于是"业务层判定"只能发生在 nil 上；否则
+        // `SweepAction` 好不容易算好的结果会被这里无声覆盖，而且两处算法一旦分叉，
+        // 订阅账目的徽标就会随写入路径随机变化。
+        //
+        // `today` 必须来自 `todayProvider()`（架构 R7）：`Date()` 在这里是错的——
+        // 冷启动补漏会生成几十天前的历史账目，用"现在"当基准会把它们全部标成待确认。
+        if prepared.confirmRaw == nil {
+            switch prepared.source {
+            case .subscription:
+                prepared.confirmRaw = EntryConfirmation.forSubscription(
+                    occurredDay: prepared.occurredDay,
+                    today: todayProvider()
+                ).raw
+            case .manual, .todo:
+                // 手动记账是用户自己敲的，待办完成时那次点击本身就是一次人工确认
+                prepared.confirmRaw = EntryConfirmation.confirmed.raw
             }
         }
 

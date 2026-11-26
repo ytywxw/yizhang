@@ -114,7 +114,7 @@ struct StatisticsView: View {
                                 colorHex: { viewModel.colorHex(for: $0) },
                                 summary: viewModel.categorySummary
                             ) { share in
-                                drillTarget = DrillTarget(share: share)
+                                drillTarget = .category(share)
                             }
                         }
 
@@ -124,7 +124,7 @@ struct StatisticsView: View {
                             iconName: { viewModel.iconName(for: $0) },
                             colorHex: { viewModel.colorHex(for: $0) }
                         ) { share in
-                            drillTarget = DrillTarget(share: share)
+                            drillTarget = .category(share)
                         }
                         .padding(.horizontal, -Theme.Spacing.md)
                     }
@@ -151,6 +151,48 @@ struct StatisticsView: View {
                 }
                 .id("trend")
 
+                StatsCard(
+                    title: "\(viewModel.metric.displayName)同比环比",
+                    subtitle: viewModel.comparisonSubtitle,
+                    isEmpty: viewModel.isComparisonEmpty,
+                    emptyMessage: StatisticsEmptyCopy.comparison(
+                        rangeTitle: viewModel.rangeTitle,
+                        metric: viewModel.metric
+                    ),
+                    emptyIcon: "arrow.up.arrow.down"
+                ) {
+                    ComparisonCardContent(
+                        comparison: viewModel.comparison,
+                        bounds: viewModel.comparisonBounds,
+                        range: viewModel.range,
+                        metric: viewModel.metric,
+                        today: viewModel.today
+                    )
+                }
+                .id("comparison")
+
+                StatsCard(
+                    title: "\(viewModel.metric.displayName)账户构成",
+                    subtitle: viewModel.rangeTitle,
+                    isEmpty: viewModel.accountShares.isEmpty,
+                    emptyMessage: StatisticsEmptyCopy.accountShares(
+                        rangeTitle: viewModel.rangeTitle,
+                        metric: viewModel.metric
+                    ),
+                    emptyIcon: "creditcard"
+                ) {
+                    AccountShareCardContent(
+                        shares: viewModel.accountShares,
+                        metric: viewModel.metric,
+                        title: { viewModel.title(for: $0) },
+                        isArchived: { viewModel.isArchived($0) },
+                        canDrill: { viewModel.canDrill(into: $0) }
+                    ) { share in
+                        drillTarget = .account(share)
+                    }
+                }
+                .id("accounts")
+
                 Color.clear.frame(height: Theme.Spacing.md)
             }
             .padding(.top, Theme.Spacing.sm)
@@ -172,14 +214,26 @@ struct StatisticsView: View {
             await viewModel.refresh()
         }
         .navigationDestination(item: $drillTarget) { target in
-            CategoryEntriesView(
-                categoryTitle: viewModel.title(for: target.share),
-                range: viewModel.range,
-                today: viewModel.today,
-                categoryID: target.share.categoryID,
-                isMerged: target.share.isMerged,
-                mergedCategoryIDs: viewModel.snapshot.mergedCategoryIDs
-            )
+            switch target.kind {
+            case let .category(share):
+                CategoryEntriesView(
+                    categoryTitle: viewModel.title(for: share),
+                    range: viewModel.range,
+                    today: viewModel.today,
+                    categoryID: share.categoryID,
+                    isMerged: share.isMerged,
+                    mergedCategoryIDs: viewModel.snapshot.mergedCategoryIDs
+                )
+            case let .account(share):
+                AccountEntriesView(
+                    accountTitle: viewModel.title(for: share),
+                    range: viewModel.range,
+                    today: viewModel.today,
+                    metric: viewModel.metric,
+                    accountIDs: viewModel.drillAccountIDs(for: share),
+                    isMerged: share.isMerged
+                )
+            }
         }
         .confirmationDialog(
             "跳到那个月的账本？",
@@ -365,12 +419,24 @@ struct StatisticsView: View {
             demoScrollAnchor = "trend"
         case "stats-lower":
             demoScrollAnchor = "category"
+        case "stats-comparison":
+            demoScrollAnchor = "comparison"
+        case "stats-accounts":
+            demoScrollAnchor = "accounts"
+        case "stats-account-drill":
+            // 账户构成的下钻同样是 pushed 页面，合成不了点击
+            Task { @MainActor in
+                await Task.yield()
+                if let top = viewModel.accountShares.first(where: { viewModel.canDrill(into: $0) }) {
+                    drillTarget = .account(top)
+                }
+            }
         case "stats-drill":
             // 下钻是 pushed 页面，同样合成不了点击；等一拍让首帧先画完再 push
             Task { @MainActor in
                 await Task.yield()
                 if let top = viewModel.snapshot.categoryShares.first {
-                    drillTarget = DrillTarget(share: top)
+                    drillTarget = .category(top)
                 }
             }
         case "stats":
@@ -384,10 +450,29 @@ struct StatisticsView: View {
 
 // MARK: - 下钻目标
 
-/// 分类下钻的导航目标（`CategoryShare` 不是 `Identifiable`）。
+/// 下钻的导航目标。
+///
+/// 为什么把两种下钻合成**一个** item 而不是加第二个 `.navigationDestination(item:)`：
+/// 同一层视图上叠两个 `item:` 版本的 destination，二者的注册顺序在 SwiftUI 里没有保证，
+/// 表现是"点分类偶尔没反应"。合成一个枚举后只有一个 destination、只有一条 push 路径，
+/// 同时把"分类 / 账户"的互斥关系写进了类型。
 private struct DrillTarget: Identifiable, Hashable {
+
+    enum Kind: Hashable {
+        case category(CategoryShare)
+        case account(AccountShare)
+    }
+
     let id = UUID()
-    let share: CategoryShare
+    let kind: Kind
+
+    static func category(_ share: CategoryShare) -> DrillTarget {
+        DrillTarget(kind: .category(share))
+    }
+
+    static func account(_ share: AccountShare) -> DrillTarget {
+        DrillTarget(kind: .account(share))
+    }
 }
 
 // MARK: - 预览

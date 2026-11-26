@@ -423,6 +423,165 @@ enum DebugDemoData {
         PerfProbe.record(String(format: "[PERF] seeded %d entries in %.0fms", inserted, elapsed))
     }
 
+    // MARK: - 记账模板演示数据（UI 测试用）
+
+    /// 启动参数键：注入 3 个记账模板。
+    static let templatesFlagKey = "YIZHANG_DEMO_TEMPLATES"
+
+    /// 若被要求且库里一个模板都没有，则插入 3 个模板。
+    ///
+    /// 存在的唯一理由是 **UI 测试需要 chips 真的存在**：`TemplateChipsRow` 在
+    /// `templates.isEmpty` 时整行不渲染（连小字一起），没有模板就没有任何 chip
+    /// 可供断言——空态正常不等于 chips 正常。
+    ///
+    /// 判重看 `count() == 0` 而不是"某一条在不在"：`TemplateService.create` 有 20 条
+    /// 上限校验（`TemplateService.swift` 的 `limit`），守卫写松了反复冷启动会撞上限抛
+    /// `limitReached`，种子自己先把库搞坏。
+    ///
+    /// 名字刻意短、备注刻意和名字不同：点 chip 会把 `note` 无条件写进表单，所以
+    /// 「备注变成了模板备注」是 UI 测试里最稳的断言点（金额框没有 accessibilityIdentifier）。
+    ///
+    /// - Parameters:
+    ///   - template: 模板服务（走真实校验与写入路径）。
+    ///   - writer: 用来把分类 / 账户名解析成 id（不硬编码 UUID）。
+    static func seedTemplatesIfRequested(template: TemplateService, writer: LedgerWriter) {
+        guard UserDefaults.standard.bool(forKey: templatesFlagKey) else { return }
+        guard (try? template.count()) == 0 else { return }
+
+        let expenseCategories = (try? writer.fetch(
+            QueryDescriptors.categories(of: .expense, includeHidden: false)
+        )) ?? []
+        let accounts = (try? writer.fetch(QueryDescriptors.accounts(includeArchived: false))) ?? []
+        guard !expenseCategories.isEmpty, !accounts.isEmpty else { return }
+
+        let categoryByName = Dictionary(
+            uniqueKeysWithValues: expenseCategories.map { ($0.name, $0.id) }
+        )
+        let accountByName = Dictionary(uniqueKeysWithValues: accounts.map { ($0.name, $0.id) })
+
+        struct Plan {
+            let name: String
+            let amount: Int64
+            let note: String
+            let categoryName: String
+            let accountName: String
+        }
+
+        let plans: [Plan] = [
+            Plan(name: "午饭", amount: 2800, note: "模板备注-午饭",
+                 categoryName: "餐饮", accountName: "微信"),
+            Plan(name: "通勤", amount: 600, note: "模板备注-通勤",
+                 categoryName: "交通出行", accountName: "支付宝"),
+            Plan(name: "咖啡", amount: 2500, note: "模板备注-咖啡",
+                 categoryName: "餐饮", accountName: "微信")
+        ]
+
+        for plan in plans {
+            _ = try? template.create(
+                TemplateDraft(
+                    name: plan.name,
+                    typeRaw: EntryType.expense.raw,
+                    amount: plan.amount,
+                    hasAmount: true,
+                    note: plan.note,
+                    categoryID: categoryByName[plan.categoryName],
+                    accountID: accountByName[plan.accountName]
+                )
+            )
+        }
+    }
+
+    // MARK: - 重复待办演示数据（V1.1 删除语义 / UI 测试用）
+
+    /// 启动参数键：注入 3 条待办（未完成+重复 / 已完成+重复+带花销 / 未完成+非重复）。
+    static let repeatingTodosFlagKey = "YIZHANG_DEMO_TODOS_REPEAT"
+
+    /// 若被要求且库里没有任何重复待办，则插入三条待办（两条重复 + 一条非重复）。
+    ///
+    /// 为什么现有的 `seedTodosIfRequested` 不能干这件事：那 7 条**没有一条设 `repeatRule`**，
+    /// 而列表页的三个删除弹层全部门禁在 `isRepeating` 上——
+    /// 没有重复待办，这些界面在 UI 测试里根本走不到，写了也是空跑。
+    ///
+    /// 三条的分工是刻意的：
+    /// - ① 未完成 + 重复 → 点行进编辑页，编辑页危险卡片出「删除这一期 / 删除此次及以后」；
+    /// - ② 已完成 + 重复 + 带花销 → 走真实 `complete` + `confirmCompletion` 产出一笔账目，
+    ///   列表「已完成」分组里的「⋯」才出「删除这条记录」；
+    /// - ③ 未完成 + 非重复 → 「删除这条待办？」那一支的唯一可达样本（见下方 ③ 的注释）。
+    ///
+    /// ② **必须走真实业务路径，不许手改 `status`**：`complete` 会顺手 spawn 下一期
+    /// （`spawnNextOccurrenceIfNeeded`），这正是「删这条历史记录不会停掉系列」这句文案的
+    /// 现实来源。手改字段造出来的样本和线上数据形状不一样，将来改 `complete` 时测试不会红。
+    ///
+    /// - Parameters:
+    ///   - todo: 待办服务（走真实业务路径）。
+    ///   - writer: 用来把分类 / 账户名解析成 id。
+    static func seedRepeatingTodosIfRequested(todo: TodoService, writer: LedgerWriter) {
+        guard UserDefaults.standard.bool(forKey: repeatingTodosFlagKey) else { return }
+
+        // 幂等看"有没有重复待办"而不是"库里有没有待办"：`YIZHANG_DEMO_TODOS` 可能同时开着，
+        // 两套种子互不干扰才有意义（合并成一个守卫会让先跑的那个悄悄吃掉另一个）。
+        let existing = (try? todo.todos()) ?? []
+        guard !existing.contains(where: { $0.repeatRule != .none }) else { return }
+
+        let expenseCategories = (try? writer.fetch(
+            QueryDescriptors.categories(of: .expense, includeHidden: false)
+        )) ?? []
+        let accounts = (try? writer.fetch(QueryDescriptors.accounts(includeArchived: false))) ?? []
+
+        let categoryByName = Dictionary(
+            uniqueKeysWithValues: expenseCategories.map { ($0.name, $0.id) }
+        )
+        let accountByName = Dictionary(uniqueKeysWithValues: accounts.map { ($0.name, $0.id) })
+        let categoryID = categoryByName["餐饮"]
+        let accountID = accountByName["微信"]
+
+        let today = DateOnly(Date())
+
+        // ① 未完成 + 重复：编辑页删除卡片的「删除这一期 / 删除此次及以后」样本
+        _ = try? todo.create(
+            TodoDraft(
+                title: "每天喝水",
+                dueDay: today.key,
+                repeatRule: .daily,
+                repeatInterval: 1,
+                categoryID: categoryID,
+                accountID: accountID
+            )
+        )
+
+        // ② 已完成 + 重复 + 带花销：列表「已完成」分组的「删除这条记录」样本
+        if let id = try? todo.create(
+            TodoDraft(
+                title: "续费会员",
+                note: "月度订阅",
+                dueDay: today.key,
+                hasExpense: true,
+                hasEstimatedAmount: true,
+                estimatedAmount: 2500,
+                repeatRule: .monthly,
+                repeatInterval: 1,
+                categoryID: categoryID,
+                accountID: accountID
+            )
+        ), let request = try? todo.complete(id: id) {
+            _ = try? todo.confirmCompletion(
+                CompletionConfirmation(amountCents: 2500),
+                for: request
+            )
+        }
+
+        // ③ 未完成 + 非重复：编辑页删除卡片三分支里最小的一支（「删除这条待办？」）。
+        //    没有它，那条分支在 UI 上根本不可达 —— 另外两条都长在重复待办上。
+        _ = try? todo.create(
+            TodoDraft(
+                title: "倒垃圾",
+                dueDay: today.key,
+                categoryID: categoryID,
+                accountID: accountID
+            )
+        )
+    }
+
     // MARK: - 待办演示数据（T15 / T16 验收用）
 
     /// 启动参数键：注入 2 条待办（一条带花销、一条不带）。

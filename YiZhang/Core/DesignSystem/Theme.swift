@@ -56,6 +56,14 @@ enum Theme {
         static let transfer = Color.secondary
         /// 逾期 / 危险
         static let danger = adaptiveColor(lightHex: "#C0392B", darkHex: "#FF7B6B")
+        /// 「待确认」徽标：琥珀色（V1.1 F-SUB-13）。
+        ///
+        /// 为什么不能用 `danger`：待确认只是"还没核对"，账目本身完全正常，
+        /// 用红色会让用户以为这一笔出了问题（与「金额颜色只表类型」同一条纪律）。
+        /// 也不能用 `.secondary`：那是"来源徽章"的颜色，两个灰度徽章并排等于都没有强调。
+        /// 对比度：浅 #9A5B00 对白底 ≈5.2:1，深 #FFC44D 对 #1C1C1E ≈10.9:1，都过 4.5:1。
+        static let pending = adaptiveColor(lightHex: "#9A5B00", darkHex: "#FFC44D")
+
         /// 卡片背景（深色模式下与页面背景形成层次）
         static let cardBackground = Color(uiColor: .secondarySystemGroupedBackground)
         /// 页面背景

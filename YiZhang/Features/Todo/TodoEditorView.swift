@@ -17,6 +17,23 @@
 
 import SwiftUI
 
+// MARK: - 关闭编辑器时交给调用方的信封
+
+/// 编辑器关闭时回传给调用方的结果。
+///
+/// **为什么删除必须把 `receipt` 一起交出去**：详情页删完就 `dismiss()` 了，
+/// 页面上没有地方可以挂一个 3 秒撤销 Toast。撤销窗口由 `TodoListViewModel`
+/// 那**一个** `undoExpiryTask` 独占（`undoWindow` 也只有一个常量）。
+/// 凭据只有回到列表页，才能接进同一个窗口；让详情页自己再开一个窗口，
+/// 屏幕上就会有两条独立的 3 秒计时器 —— 一条过期清掉另一条的凭据，
+/// 用户点了「撤销」没反应且没有任何报错。这是明确要避免的形态。
+enum TodoEditorResult: Hashable, Sendable {
+    /// 保存成功。关联值为 Toast 文案（「已添加待办」/「已保存」）。
+    case saved(String)
+    /// 删除成功。`message` 是 Toast 文案，`receipt` 是撤销凭据。
+    case deleted(message: String, receipt: TodoDeletionReceipt)
+}
+
 /// 待办编辑 / 详情页。
 struct TodoEditorView: View {
 
@@ -29,8 +46,11 @@ struct TodoEditorView: View {
     @State private var showsDeleteConfirmation = false
     @State private var detailEntryID: UUID?
 
-    /// 完成回调（列表用来弹 Toast；`nil` = 用户直接关掉了）。
-    var onFinished: (String?) -> Void
+    /// 完成回调（列表用来弹 Toast；`nil` = 用户取消，什么都没发生）。
+    ///
+    /// 删除了什么必须原样交出去 —— 调用方（列表页）靠 `receipt` 把这次删除接进
+    /// 它自己的 3 秒撤销窗口。见 `TodoEditorResult` 的文档。
+    var onFinished: (TodoEditorResult?) -> Void
 
     /// - Parameters:
     ///   - mode: 新建 / 编辑。
@@ -39,7 +59,7 @@ struct TodoEditorView: View {
     init(
         mode: TodoEditorViewModel.Mode,
         today: DateOnly = DateOnly(Date()),
-        onFinished: @escaping (String?) -> Void = { _ in }
+        onFinished: @escaping (TodoEditorResult?) -> Void = { _ in }
     ) {
         _viewModel = State(initialValue: TodoEditorViewModel(mode: mode, today: today))
         self.onFinished = onFinished
@@ -88,6 +108,7 @@ struct TodoEditorView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("取消") {
+                        // `nil` = 什么都没发生。调用方据此不弹 Toast、也不动撤销窗口。
                         onFinished(nil)
                         dismiss()
                     }
@@ -116,20 +137,45 @@ struct TodoEditorView: View {
             } message: {
                 Text("「保留账目」：这笔钱确实花出去了，只把待办退回未完成。\n「删除账目」：同时把那笔账软删掉（还能撤销）。")
             }
+            // 删除确认：**一个** `.confirmationDialog` + 条件按钮，不是叠三个。
+            //
+            // 叠三个 `.confirmationDialog` 在同一层视图上时，后加的会顶掉先加的，
+            // 用户点到的按钮和看到的正文可能不是一回事 —— 这个坑在
+            // `TodoListView` 的「删除这一期 / 删除此次及以后」上已经踩过一次，
+            // 那里是靠"各自一个状态位"解决的，这里只有一个删除入口，条件按钮就够。
+            //
+            // 三分支的理由是**详情页必须说出它实际在做的事**：
+            //   ① 已完成的那条删的是「一条记录」，重复设置不动（历史记录不该带副作用）；
+            //   ② 未完成的重复待办删一次有两种后果（跳过 / 终止），两个都得摆出来；
+            //   ③ 非重复就是普通删除，不需要额外解释。
             .confirmationDialog(
-                "删除这条待办？",
+                deleteDialogTitle,
                 isPresented: $showsDeleteConfirmation,
                 titleVisibility: .visible
             ) {
-                Button("删除", role: .destructive) {
-                    if let message = viewModel.delete() {
-                        onFinished(message)
-                        dismiss()
+                if viewModel.isDone {
+                    Button("删除这条记录", role: .destructive) {
+                        // 已完成：只删这一条。走 `deleteAndStopSeries` 而不是裸删是因为
+                        // 服务层两个方法已经覆盖了所有删除形态，详情页不留第三条通路。
+                        finishDeletion(viewModel.deleteAndStopSeries())
                     }
+                    Button("取消", role: .cancel) {}
+                } else if viewModel.isRepeating {
+                    Button("删除这一期", role: .destructive) {
+                        finishDeletion(viewModel.deleteCurrentOccurrence())
+                    }
+                    Button("删除此次及以后", role: .destructive) {
+                        finishDeletion(viewModel.deleteAndStopSeries())
+                    }
+                    Button("取消", role: .cancel) {}
+                } else {
+                    Button("删除", role: .destructive) {
+                        finishDeletion(viewModel.deleteAndStopSeries())
+                    }
+                    Button("取消", role: .cancel) {}
                 }
-                Button("取消", role: .cancel) {}
             } message: {
-                Text("待办本身会被移除。已经记过的账目会保留——那笔钱确实花出去了。")
+                Text(deleteDialogMessage)
             }
             .navigationDestination(item: $detailEntryID) { id in
                 EntryDetailView(entryID: id)
@@ -433,6 +479,30 @@ struct TodoEditorView: View {
         }
     }
 
+    // MARK: - 删除确认的三套文案
+
+    /// 确认弹层的标题（按这条待办的实际状态换）。
+    private var deleteDialogTitle: String {
+        if viewModel.isDone { return "删除这条记录？" }
+        if viewModel.isRepeating { return "删除还是停止重复？" }
+        return "删除这条待办？"
+    }
+
+    /// 确认弹层的正文。
+    ///
+    /// 文案里**不出现「明天」**：周期可能是每周 / 每月，只有「下一期」才是与周期无关的说法。
+    /// 这是列表页「跳过这一期？」那处已经立下的规矩，两处必须同口径。
+    private var deleteDialogMessage: String {
+        if viewModel.isDone {
+            return "只删掉这一条已完成记录，重复设置不会被修改。已经记过的账目会保留。"
+        }
+        if viewModel.isRepeating {
+            return "「删除这一期」：这一条删掉，下一期照常出现。\n"
+                + "「删除此次及以后」：以后不会再出现，已完成的历史记录会保留。"
+        }
+        return "待办本身会被移除。已经记过的账目会保留。"
+    }
+
     // MARK: - 组件
 
     private func card<Content: View>(
@@ -562,7 +632,22 @@ struct TodoEditorView: View {
             Task { _ = await environment.notifications.requestPermissionIfNeeded() }
         }
 
-        onFinished(result.isNew ? "已添加待办" : "已保存")
+        onFinished(.saved(result.isNew ? "已添加待办" : "已保存"))
+        dismiss()
+    }
+
+    /// 删除 → 把结果原样交给调用方 → 关掉本页。
+    ///
+    /// 失败时**不 dismiss**：停在当前页把错误显示出来，用户还能重试。
+    /// 成功时连撤销凭据一起回传（本页没有撤销 Toast 的位置，见 `TodoEditorResult`）。
+    private func finishDeletion(_ result: TodoEditorResult?) {
+        guard let result else {
+            if let message = viewModel.errorMessage {
+                toast = ToastItem(message: message)
+            }
+            return
+        }
+        onFinished(result)
         dismiss()
     }
 

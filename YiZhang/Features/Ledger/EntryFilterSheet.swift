@@ -2,13 +2,15 @@
 //  EntryFilterSheet.swift
 //  一账 / Features / Ledger
 //
-//  职责：账目筛选面板（T09）——时间 / 类型 / 分类 / 账户 / 来源 / 关键词 六个维度。
+//  职责：账目筛选面板（T09 / V1.1）——时间 / 类型 / 确认状态 / 分类 / 账户 / 来源 / 关键词
+//  七个维度。第七维「待确认」（`pendingOnly`）是 V1.1 F-SUB-13 加的，属于"勾选即生效"的
+//  单值开关，所以复刻 `typeSection` 的写法，不新增任何匹配逻辑。
 //
 //  为什么面板里维护一份 `draft` 而不是直接改父级条件：
 //  筛选是"调好再应用"的动作。边调边刷列表会让列表在面板下面反复跳动，
 //  用户既看不清自己在选什么，也失去了「取消」的意义。
 //
-//  为什么六个维度全塞在一个面板里（而不是分成六个二级页）：
+//  为什么七个维度全塞在一个面板里（而不是分成七个二级页）：
 //  真实使用中"筛一个分类"和"筛这个分类下支付宝的那几笔"是同一个念头的两步，
 //  分页会让第二步回到第一步重新找入口。一屏放得下（≤ 19 分类 + 5 账户），就不要分页。
 //
@@ -53,6 +55,7 @@ struct EntryFilterSheet: View {
                 VStack(spacing: Theme.Spacing.sm) {
                     timeSection
                     typeSection
+                    pendingSection
                     sourceSection
                     categorySection
                     accountSection
@@ -162,6 +165,28 @@ struct EntryFilterSheet: View {
                     FilterChip(title: type.displayName, isSelected: draft.types.contains(type)) {
                         draft.toggleType(type)
                     }
+                }
+            }
+        }
+    }
+
+    // MARK: - 确认状态（V1.1 F-SUB-13 第七维）
+
+    /// 第七维「待确认」。刻意复刻 `typeSection` 的写法（同样的 `sectionCard` +
+    /// `chipFlow` + `FilterChip`），因为它虽然只有一个开关，但视觉上必须和
+    /// 「类型」「来源」是同一类东西——用户不关心底层是多选还是单选。
+    ///
+    /// 为什么是"开关"而不是"多选 chip"：确认状态只有两种取值（待确认 / 不限），
+    /// 做成多选会给出「待确认 + 已确认」这种等价于"不限"的第三种状态，
+    /// 语义上多一层没有意义的组合。
+    private var pendingSection: some View {
+        sectionCard(title: "确认状态") {
+            chipFlow {
+                FilterChip(
+                    title: EntryFilter.pendingChipTitle,
+                    isSelected: draft.pendingOnly
+                ) {
+                    draft.pendingOnly.toggle()
                 }
             }
         }

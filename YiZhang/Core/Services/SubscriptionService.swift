@@ -250,6 +250,12 @@ final class SubscriptionService {
     /// 写入提交后的回调（由 `AppEnvironment` 接到 `bumpDataVersion()`）。
     var onDidCommit: (() -> Void)?
 
+    /// **软删之后**的清理钩子（V1.1；`denyEntry` 是本类唯一的软删入口）。
+    ///
+    /// 语义与 `LedgerService.onDidSoftDelete` 完全一致，理由也一样：
+    /// `TrashService` 强依赖本类，本类若再强引用 `TrashService` 就成环，所以用闭包单向出去。
+    var onDidSoftDelete: (() -> Void)?
+
     init(writer: LedgerWriter, ledger: LedgerService, onDidCommit: (() -> Void)? = nil) {
         self.writer = writer
         self.ledger = ledger
@@ -551,6 +557,56 @@ final class SubscriptionService {
         guard let subscription = try writer.subscription(id: id) else { return }
         try writer.delete(subscription)
         onDidCommit?()
+    }
+
+    // MARK: - 否定待确认账目（V1.1 F-SUB-13，「不是这笔」）
+
+    /// 用户说"这笔不是我花的/不是这笔"：软删这条账目，并让该订阅的这个周期不再生成。
+    ///
+    /// 为什么写在 `SubscriptionService` 而不是 `LedgerService`：
+    /// 否定的第三、四步（抑制订阅周期）必须触及订阅对象，而 `SubscriptionService` 已经
+    /// 依赖 `LedgerService`（`init(writer:ledger:)`）。把 `SubscriptionService` 注入
+    /// `LedgerService` 会形成一个环，环在 Swift 里不是"编译不过"而是"必须用隐式解包/弱引用
+    /// 去糊"，那种结构会在测试里变成偶发的 nil 崩溃。放在这里则是单向依赖，无需任何妥协。
+    ///
+    /// 执行顺序是硬的（每一步都在下一步失败时仍然正确）：
+    /// ① 取**删除前**快照（撤销与后续抑制都要用它，删完就取不到了）；
+    /// ② `writer.markDeleted`——软删标记的唯一入口（R1：`deletedAt` / `deletedDay` 两列同进同出；
+    ///    不许在这里直接赋 `deletedAt`）；
+    /// ③ 该账目来自订阅、且周期键 / 订阅 id 齐全 → 把它写进 `suppressedCycles`。
+    ///    抑制表是**第二道保险**：软删记录本身仍占着幂等键（R-SUB-7），扫描本来就会跳过这一期；
+    ///    但一旦将来某条路径把它硬删了，抑制表还能挡住"这一期又冒出来"（风险 R8 的一半）。
+    ///    订阅已经被删掉时**跳过抑制、不抛错**——用户说"不是这笔"，账目必须照样消失；
+    ///    为一个已经不存在的订阅弹一句"找不到订阅"是纯粹的错误提示；
+    /// ④ 广播一次。`suppress` 内部也会广播（它自己也改了数据），多一次自增是无害的幂等信号。
+    ///
+    /// **`nextBillingDay` 一律不回退**：否定的语义是"这一期我没花这笔钱"，不是
+    /// "重新来过"。回退会让下一次扫描生成同一个周期的新账目，用户删一次它就长一次（死循环）。
+    ///
+    /// 幂等：同一条账目再否定一次 = 它已经是删除态 → 静默返回 `nil`，不写库、不报错。
+    ///
+    /// - Parameter id: 待否定的账目 id。
+    /// - Returns: 可撤销凭据（含删除前全字段快照）；账目不存在或已被删除时返回 `nil`。
+    @discardableResult
+    func denyEntry(id: UUID) throws -> UndoToken? {
+        guard let entry = try writer.entry(id: id) else { return nil }
+        guard !entry.isDeleted else { return nil }
+
+        let moment = Date()
+        let snapshot = LedgerEntrySnapshot(entry: entry)
+        try writer.markDeleted(entry, at: moment)
+
+        if snapshot.source == .subscription,
+           let cycleKey = snapshot.sourceCycleKey,
+           let subscriptionID = snapshot.sourceRefID,
+           (try writer.subscription(id: subscriptionID)) != nil {
+            // 抑制失败（例如同一周期已抑制过）不应让整次否定失败
+            _ = try? suppress(cycleKey: cycleKey, of: subscriptionID)
+        }
+
+        onDidCommit?()
+        onDidSoftDelete?()
+        return UndoToken(entryID: snapshot.id, deletedAt: moment, snapshot: snapshot)
     }
 
     // MARK: - 抑制周期（R-SUB-DEL A 分支）

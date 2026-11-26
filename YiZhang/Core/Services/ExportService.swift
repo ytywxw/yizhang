@@ -107,6 +107,11 @@ struct ExportRow: Hashable, Sendable {
     let createdAt: Date
     /// 是否软删（`deletedAt != nil`）。
     let isDeleted: Bool
+    /// 是否「待确认」的订阅账目（V1.1 F-SUB-13）。
+    ///
+    /// 只从 `LedgerLite.isPending` / `LedgerEntry.isPending` 取，**不在这里重算**
+    /// （确认状态的判据只有 `EntryConfirmation` 一处，导出是"搬运"不是"判断"）。
+    let isPending: Bool
 
     init(
         occurredDay: Int32,
@@ -118,7 +123,8 @@ struct ExportRow: Hashable, Sendable {
         note: String = "",
         sourceRaw: String = EntrySource.manual.raw,
         createdAt: Date = Date(timeIntervalSince1970: 0),
-        isDeleted: Bool = false
+        isDeleted: Bool = false,
+        isPending: Bool = false
     ) {
         self.occurredDay = occurredDay
         self.typeRaw = typeRaw
@@ -130,6 +136,7 @@ struct ExportRow: Hashable, Sendable {
         self.sourceRaw = sourceRaw
         self.createdAt = createdAt
         self.isDeleted = isDeleted
+        self.isPending = isPending
     }
 
     var type: EntryType { EntryType(raw: typeRaw) ?? .expense }
@@ -210,6 +217,49 @@ final class ExportService {
         "日期", "类型", "金额", "分类", "账户", "收款账户", "备注", "来源", "创建时间"
     ]
 
+    /// 带 `确认状态` 列时的表头（V1.1 F-SUB-13）。
+    ///
+    /// **为什么另起一个常量而不是改 `csvHeaderColumns`**：
+    /// `csvHeaderColumns` 是已发布的契约——用户可能已经按 10 列写好了脚本，
+    /// 在中间插一列会让所有既有脚本把「备注」读成「确认状态」。
+    /// 新列只在**显式要求**时才出现（`includesConfirmationColumn: true`），
+    /// 默认路径逐字不变。
+    ///
+    /// `确认状态` 排在 `已删除` 之前：它是账目本身的业务状态，
+    /// 与"来源"同属一档；`已删除` / `创建时间` 才是后置的元信息。
+    nonisolated static let csvHeaderColumnsWithConfirmation = [
+        "日期", "类型", "金额", "分类", "账户", "收款账户", "备注", "来源",
+        "确认状态", "已删除", "创建时间"
+    ]
+
+    /// 带 `确认状态` 列、但不带 `已删除` 列的表头。
+    nonisolated static let csvHeaderColumnsWithoutDeletedWithConfirmation = [
+        "日期", "类型", "金额", "分类", "账户", "收款账户", "备注", "来源",
+        "确认状态", "创建时间"
+    ]
+
+    /// 按两个开关选表头。
+    ///
+    /// 表头与下面的数据行必须由**同一组开关**决定，否则整张表会错列——
+    /// 错列之后用户看到的金额全是别人的，这是导出功能最致命的一种 bug。
+    /// 所以两个开关只在这里各判一次，`csv` 的表头与行都从这里出发。
+    ///
+    /// - Parameters:
+    ///   - includesDeletedColumn: 是否保留 `已删除` 列。
+    ///   - includesConfirmationColumn: 是否保留 `确认状态` 列。
+    /// - Returns: 与当前开关匹配的表头（四个组合各有一个常量，逐字可断言）。
+    nonisolated static func headerColumns(
+        includesDeletedColumn: Bool,
+        includesConfirmationColumn: Bool
+    ) -> [String] {
+        switch (includesDeletedColumn, includesConfirmationColumn) {
+        case (true, false): return csvHeaderColumns
+        case (false, false): return csvHeaderColumnsWithoutDeleted
+        case (true, true): return csvHeaderColumnsWithConfirmation
+        case (false, true): return csvHeaderColumnsWithoutDeletedWithConfirmation
+        }
+    }
+
     /// CSV 记录分隔符（RFC 4180：CRLF，不是 \n）。
     nonisolated static let recordSeparator = "\r\n"
 
@@ -285,12 +335,22 @@ final class ExportService {
     /// - Parameters:
     ///   - rows: 数据行（调用方已按需过滤软删）。
     ///   - includesDeletedColumn: 是否保留 `已删除` 列（默认保留，符合导出规范）。
+    ///   - includesConfirmationColumn: 是否保留 `确认状态` 列。
+    ///     **默认 `false`**：默认表头必须逐字等于 `csvHeaderColumns`（已发布契约），
+    ///     需要这一列的地方（导出页）显式传 `true`。
     /// - Returns: 可直接写入文件的字符串。
-    nonisolated static func csv(rows: [ExportRow], includesDeletedColumn: Bool = true) -> String {
+    nonisolated static func csv(
+        rows: [ExportRow],
+        includesDeletedColumn: Bool = true,
+        includesConfirmationColumn: Bool = false
+    ) -> String {
         var output = byteOrderMark
         output.reserveCapacity(rows.count * 96 + 128)
 
-        let header = includesDeletedColumn ? csvHeaderColumns : csvHeaderColumnsWithoutDeleted
+        let header = headerColumns(
+            includesDeletedColumn: includesDeletedColumn,
+            includesConfirmationColumn: includesConfirmationColumn
+        )
         output += header.map(escape).joined(separator: ",")
         output += recordSeparator
 
@@ -305,6 +365,11 @@ final class ExportService {
                 row.note,
                 row.source.displayName
             ]
+            if includesConfirmationColumn {
+                // 与 `已删除` 列同理给机读值（`pending` / `confirmed`），
+                // 而不是"待确认 / 已确认"：这一列是给脚本过滤用的。
+                fields.append(row.isPending ? "pending" : "confirmed")
+            }
             if includesDeletedColumn {
                 // 用 true / false 而不是"是 / 否"：这一列是给脚本过滤用的。
                 fields.append(row.isDeleted ? "true" : "false")
@@ -336,10 +401,11 @@ final class ExportService {
     /// 生成 JSON：`{"version":1,"exportedAt":"…","entries":[…]}`。
     ///
     /// 每条含 `amountCents`（整数分）、`occurredDay`（`2026-11-21`）、
-    /// `type` / `source`（raw 值，机读）、`deleted`（Bool）。
+    /// `type` / `source`（raw 值，机读）、`deleted`（Bool）、
+    /// `confirmation`（`pending` / `confirmed`，V1.1）。
     ///
-    /// `deleted` **恒定存在**（不随导出页的开关变化）：JSON 是给程序读的，
-    /// 少一个字段就得让消费方按"有没有开关"写两套解析逻辑。
+    /// `deleted` 与 `confirmation` **恒定存在**（不随导出页的开关变化）：
+    /// JSON 是给程序读的，少一个字段就得让消费方按"有没有开关"写两套解析逻辑。
     nonisolated static func json(rows: [ExportRow], exportedAt: Date = Date()) -> String {
         var entries: [[String: Any]] = []
         entries.reserveCapacity(rows.count)
@@ -354,6 +420,7 @@ final class ExportService {
                 "toAccount": row.toAccountName,
                 "note": row.note,
                 "source": row.sourceRaw,
+                "confirmation": row.isPending ? "pending" : "confirmed",
                 "createdAt": row.createdAtText,
                 "deleted": row.isDeleted
             ])
@@ -385,12 +452,18 @@ final class ExportService {
         rows: [ExportRow],
         format: ExportFormat,
         includesDeletedColumn: Bool = true,
+        includesConfirmationColumn: Bool = false,
         exportedAt: Date = Date()
     ) -> String {
         switch format {
         case .csv:
-            return csv(rows: rows, includesDeletedColumn: includesDeletedColumn)
+            return csv(
+                rows: rows,
+                includesDeletedColumn: includesDeletedColumn,
+                includesConfirmationColumn: includesConfirmationColumn
+            )
         case .json:
+            // JSON 不看任何列开关：`confirmation` 恒定存在，理由见 `json(rows:exportedAt:)`
             return json(rows: rows, exportedAt: exportedAt)
         }
     }
@@ -445,7 +518,9 @@ final class ExportService {
                 note: entry.note,
                 sourceRaw: entry.sourceRaw,
                 createdAt: entry.createdAt,
-                isDeleted: entry.deletedAt != nil
+                isDeleted: entry.deletedAt != nil,
+                // 确认状态只从模型上读（唯一判据在 `EntryConfirmation`），不在这里重算
+                isPending: entry.isPending
             )
         }
     }
@@ -460,10 +535,16 @@ final class ExportService {
         rows: [ExportRow],
         format: ExportFormat,
         includesDeletedColumn: Bool = true,
+        includesConfirmationColumn: Bool = false,
         today: DateOnly = DateOnly(Date())
     ) async throws -> URL {
         try await Task.detached(priority: .userInitiated) {
-            let text = text(rows: rows, format: format, includesDeletedColumn: includesDeletedColumn)
+            let text = text(
+                rows: rows,
+                format: format,
+                includesDeletedColumn: includesDeletedColumn,
+                includesConfirmationColumn: includesConfirmationColumn
+            )
             guard let data = text.data(using: .utf8) else {
                 throw ExportError.encodingFailed
             }

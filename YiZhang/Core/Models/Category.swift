@@ -56,6 +56,14 @@ final class Category {
     @Relationship(deleteRule: .nullify, inverse: \Subscription.category)
     var subscriptions: [Subscription]? = []
 
+    /// 以本分类为预设分类的记账模板（V1.1 F-ACC-14）。
+    ///
+    /// 反向关系必须显式写 `inverse:`（CloudKit 强制要求），且与本模型侧一样是 `.nullify`：
+    /// 分类被删除时只把模板的分类置空，**绝不**连带删模板——模板是输入辅助，
+    /// 丢一个字段可以接受，丢一整条模板不行。两侧 deleteRule 不一致会导致启动即崩。
+    @Relationship(deleteRule: .nullify, inverse: \EntryTemplate.category)
+    var templates: [EntryTemplate]? = []
+
     // MARK: - 初始化
 
     init() {}

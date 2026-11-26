@@ -92,10 +92,22 @@ final class Acceptance_PerformanceTests: XCTestCase {
     }
 
     /// 统计页取数（本年 = 全部 10 000 条）不得成为瓶颈。
+    ///
+    /// ⚠️ **必须取全库，不能只取当月**：本用例原先 fetch 的是
+    /// `QueryDescriptors.monthEntries(today.monthKey)`（约 833 条），却在注释里宣称
+    /// "本年 = 全部 10 000 条" —— 聚合根本没看到那 9 000 多条。V1.1 新增的
+    /// `comparison` / `accountShares` 都是**全区间线性扫描**，只在当月数据上测等于没测，
+    /// 所以这里改成 `allEntries()`，并断言条数真的等于 10 000。
     func testD3b_StatisticsOverTenThousandEntries() throws {
         let world = try AcceptanceWorld.boot()
-        let account = try world.firstAccount()
-        let category = try world.defaultExpenseCategory()
+        // 刻意**轮着用** 14 个支出分类 + 5 个账户，而不是只塞给第一个：
+        // 这两张卡的分桶数直接决定 O(n) 与 O(n·m) 的差别。全塞进一个账户时
+        // m = 1，任何"对每个账户扫一遍全部账目"的实现都跟线性扫描一样快，
+        // 500ms 阈值就抓不到它了——这个用例的全部意义就在抓这个。
+        let accounts = try world.accounts()
+        let categories = try world.expenseCategories()
+        XCTAssertGreaterThan(accounts.count, 1, "验收前提：种子数据必须有多个账户，否则测不出分桶退化")
+        XCTAssertGreaterThan(categories.count, 1, "验收前提：种子数据必须有多个支出分类")
 
         let months: [Int32] = [
             202601, 202602, 202603, 202604, 202605, 202606,
@@ -107,16 +119,14 @@ final class Acceptance_PerformanceTests: XCTestCase {
                 amount: Int64(index % 900 + 1) * 100,
                 occurredDay: month * 100 + Int32(index % 28 + 1)
             )
-            draft.categoryID = category.id
-            draft.accountID = account.id
+            draft.categoryID = categories[index % categories.count].id
+            draft.accountID = accounts[index % accounts.count].id
             try world.env.writer.insert(draft, save: false)
         }
         try world.env.writer.save()
 
         let fetchStarted = Date()
-        let entries = try world.env.readContext.fetch(
-            QueryDescriptors.monthEntries(today.monthKey)
-        )
+        let entries = try world.env.readContext.fetch(QueryDescriptors.allEntries())
         let lites = entries.map { entry in
             LedgerLite(
                 id: entry.id,
@@ -126,14 +136,66 @@ final class Acceptance_PerformanceTests: XCTestCase {
                 categoryID: entry.category?.id,
                 accountID: entry.account?.id,
                 sourceRaw: entry.sourceRaw,
+                confirmRaw: entry.confirmRaw,
                 deletedAt: entry.deletedAt
             )
         }
-        let snapshot = StatisticsCalculator.snapshot(lites, range: .thisYear, today: today)
-        let elapsed = Date().timeIntervalSince(fetchStarted) * 1_000
+        let fetchSeconds = Date().timeIntervalSince(fetchStarted)
+        XCTAssertEqual(lites.count, 10_000, "聚合必须看到全部 10 000 条，否则这个用例测的是空气")
 
-        print("[QA-PERF] 统计快照(本年) \(Int(elapsed)) ms，分类数 \(snapshot.categoryShares.count)")
-        XCTAssertGreaterThan(snapshot.totalExpense.cents, 0)
-        XCTAssertLessThan(elapsed, 500, "统计快照 \(Int(elapsed)) ms 超过 500ms")
+        // 三段分别计时：拆开才能回答"新增的两次聚合离 500ms 有多远"，
+        // 混成一个总数时若某一项退化成 O(n·m)，看不出是哪一项。
+        let snapshotStarted = Date()
+        let snapshot = StatisticsCalculator.snapshot(lites, range: .thisYear, today: today)
+        let snapshotMilliseconds = Date().timeIntervalSince(snapshotStarted) * 1_000
+
+        let comparisonStarted = Date()
+        let comparison = StatisticsCalculator.comparison(
+            lites, range: .thisYear, metric: .expense, today: today
+        )
+        let comparisonMilliseconds = Date().timeIntervalSince(comparisonStarted) * 1_000
+
+        let sharesStarted = Date()
+        let shares = StatisticsCalculator.accountShares(
+            lites, range: .thisYear, metric: .expense, today: today
+        )
+        let sharesMilliseconds = Date().timeIntervalSince(sharesStarted) * 1_000
+
+        let aggregatesMilliseconds = snapshotMilliseconds + comparisonMilliseconds + sharesMilliseconds
+
+        print(
+            """
+            [QA-PERF] 统计聚合 @ 10 000 条（本年）：
+              取数(fetch + 映射 Lite) \(Int(fetchSeconds * 1_000)) ms
+              snapshot            \(Int(snapshotMilliseconds)) ms
+              comparison          \(Int(comparisonMilliseconds)) ms
+              accountShares       \(Int(sharesMilliseconds)) ms
+              三段合计            \(Int(aggregatesMilliseconds)) ms
+              分类数 \(snapshot.categoryShares.count) / 账户数 \(shares.shares.count)
+            """
+        )
+
+        // 非空断言不是形式主义：它们在防止两件事——
+        // ① 调用被优化掉/短路返回空（那样"耗时很低"毫无意义）；
+        // ② 有人把 range 改成一段没有数据的时间窗，于是这个压测悄悄扫了个空集合。
+        XCTAssertGreaterThan(snapshot.totalExpense.cents, 0, "本年必须有支出，否则压测扫的是空集合")
+        XCTAssertGreaterThan(
+            comparison.yoy.current.cents, 0,
+            "同比当期必须是真实合计（为 0 说明区间算错了，不是「没数据」）"
+        )
+        XCTAssertFalse(shares.shares.isEmpty, "账户构成不能为空")
+        XCTAssertEqual(
+            shares.shares.reduce(Int64(0)) { $0 + $1.amount.cents },
+            snapshot.categoryTotal.cents,
+            "账户构成合计恒等于同口径分类合计（两张卡要能互相对账）"
+        )
+
+        // 阈值沿用 500ms 而不是 80ms：80ms 在 CI 机器负载波动下会变成随机红灯，
+        // 而这条用例要防的是"有人写出 O(n·m)"（10k × 19 分类 = 19 万次比较仍在毫秒级），
+        // 500ms 对这类退化足够敏感。
+        XCTAssertLessThan(
+            aggregatesMilliseconds, 500,
+            "三段聚合合计 \(Int(aggregatesMilliseconds)) ms 超过 500ms"
+        )
     }
 }

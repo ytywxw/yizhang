@@ -11,6 +11,9 @@
 //  ① 勾选框只负责完成；整行点击进详情（两件事分开，避免手滑勾掉）。
 //  ② 有花销的待办完成时先弹 T18 确认条；无花销零打扰。
 //  ③ 已完成行点击 = 撤销完成，弹三选（保留账目 / 删除账目 / 取消）——这是 R-TODO-7 的 UI。
+//  ④ 重复待办的「⋯」出「删除这一期 / 删除此次及以后」（V1.1 / F-TODO-11）：
+//     前者跳过这一次、系列继续，后者终止系列；两者的 Toast 都挂 3 秒「撤销」。
+//     已完成行只出「删除这条记录」——历史记录不该带副作用。
 //
 
 import SwiftUI
@@ -26,6 +29,18 @@ struct TodoListView: View {
     @State private var completionTarget: CompletionTarget?
     @State private var reopenTarget: TodoRowModel?
     @State private var showsReopenDialog = false
+    /// 「删除此次及以后」的确认对象（收工标准 ⑧：确认后行消失、不 spawn）。
+    @State private var stopSeriesTarget: TodoRowModel?
+    @State private var showsStopSeriesDialog = false
+    /// 「删除这一期」的确认对象。
+    ///
+    /// **单独一套状态位**，不复用 `stopSeriesTarget`：两个弹层语义相反（系列继续 / 系列终止），
+    /// 共用一个状态位时后弹的那个会顶掉前一个，用户点到的按钮和看到的正文可能不是一回事。
+    @State private var skipOccurrenceTarget: TodoRowModel?
+    @State private var showsSkipOccurrenceDialog = false
+    /// 已完成行「删除这条记录」的确认对象（仅重复系列才问一句）。
+    @State private var recordDeleteTarget: TodoRowModel?
+    @State private var showsRecordDeleteDialog = false
 
     var body: some View {
         ScrollView {
@@ -50,6 +65,7 @@ struct TodoListView: View {
                         )
                     }
 
+                    // `visibleGroups` 不含「已完成」，那一组由下面的 `completedToggleBlock` 独占渲染
                     ForEach(viewModel.visibleGroups) { group in
                         groupBlock(group)
                     }
@@ -92,8 +108,17 @@ struct TodoListView: View {
         .sheet(item: $editorTarget) { target in
             switch target.mode {
             case .todo(let mode):
-                TodoEditorView(mode: mode, today: viewModel.today) { message in
-                    if let message { toast = ToastItem(message: message) }
+                TodoEditorView(mode: mode, today: viewModel.today) { result in
+                    guard let result else { return }   // `nil` = 用户取消，什么都不做
+                    switch result {
+                    case .saved(let message):
+                        toast = ToastItem(message: message)
+                    case .deleted(let message, let receipt):
+                        // 详情页删的，撤销窗口回家（本页）来管：
+                        // 它删完就 dismiss 了，没有位置挂 3 秒 Toast，
+                        // 凭据送回来接进本页同一个窗口（见 `adoptUndo`）。
+                        show(viewModel.adoptUndo(receipt, message: message))
+                    }
                 }
             case .subscription(let id):
                 SubscriptionEditorView(mode: .edit(id), today: viewModel.today) { message in
@@ -130,6 +155,60 @@ struct TodoListView: View {
             }
         } message: { _ in
             Text("「保留账目」：这笔钱确实花出去了，只把待办退回未完成。\n「删除账目」：同时把那笔账软删掉（还能撤销）。")
+        }
+        // 「删除这一期」也要问一句（PRD 03 §4.3-4）。
+        //
+        // 理由不是"谨慎"，是这条路径**最反直觉**：点了删除、下一期照常出现。
+        // 用户看到明天又冒出来一条，会以为删除失效了。两个删除项的误解成本恰好落在轻的那个上，
+        // 所以正文必须当场把差异说清（与「不再重复？」一问一答）。
+        .confirmationDialog(
+            "跳过这一期？",
+            isPresented: $showsSkipOccurrenceDialog,
+            titleVisibility: .visible,
+            presenting: skipOccurrenceTarget
+        ) { row in
+            Button("删除这一期", role: .destructive) {
+                deleteCurrentOccurrence(row)
+                skipOccurrenceTarget = nil
+            }
+            Button("取消", role: .cancel) {
+                skipOccurrenceTarget = nil
+            }
+        } message: { row in
+            // 不写「明天」：周期可能是每周 / 每月，"下一期"才是与周期无关的说法
+            Text("「\(row.title)」这一条会被删掉，下一期照常出现。想彻底停止请用「删除此次及以后」。")
+        }
+        .confirmationDialog(
+            "不再重复？",
+            isPresented: $showsStopSeriesDialog,
+            titleVisibility: .visible,
+            presenting: stopSeriesTarget
+        ) { row in
+            Button("删除并且不再重复", role: .destructive) {
+                Task { await deleteAndStopSeries(row) }
+                stopSeriesTarget = nil
+            }
+            Button("取消", role: .cancel) {
+                stopSeriesTarget = nil
+            }
+        } message: { row in
+            Text("「\(row.title)」以后不会再出现。已完成的历史记录会保留。")
+        }
+        .confirmationDialog(
+            "删除这条记录？",
+            isPresented: $showsRecordDeleteDialog,
+            titleVisibility: .visible,
+            presenting: recordDeleteTarget
+        ) { row in
+            Button("删除这条记录", role: .destructive) {
+                delete(row)
+                recordDeleteTarget = nil
+            }
+            Button("取消", role: .cancel) {
+                recordDeleteTarget = nil
+            }
+        } message: { _ in
+            Text("只删掉这一条已完成记录，重复设置不会被修改。")
         }
         .accessibilityIdentifier("todo.list")
     }
@@ -186,7 +265,9 @@ struct TodoListView: View {
             onToggle: { toggle(row) },
             onTap: { open(row) },
             onPostpone: row.isDone ? nil : { postpone(row) },
-            onDelete: { delete(row) }
+            onDelete: { delete(row) },
+            onDeleteCurrentOccurrence: { deleteCurrentOccurrence(row) },
+            onDeleteAndStopSeries: { confirmStopSeries(row) }
         )
         .padding(.horizontal, Theme.Spacing.md)
     }
@@ -299,8 +380,50 @@ struct TodoListView: View {
     }
 
     private func delete(_ row: TodoRowModel) {
+        // 已完成的**重复**待办删的是"这一条记录"，先问一句：这句问话本身就是
+        // "不会动到重复设置"的说明（收工标准 ⑩ 的反面：已完成行绝不出现「此次及以后」）
+        if row.isDone && row.isRepeating {
+            recordDeleteTarget = row
+            showsRecordDeleteDialog = true
+            return
+        }
         if let message = viewModel.delete(id: row.id) {
             toast = ToastItem(message: message)
+        }
+    }
+
+    /// 「删除此次及以后」：先确认，再删（不可撤销之外的副作用只有一个：系列结束）。
+    private func confirmStopSeries(_ row: TodoRowModel) {
+        stopSeriesTarget = row
+        showsStopSeriesDialog = true
+    }
+
+    private func deleteAndStopSeries(_ row: TodoRowModel) async {
+        if let feedback = await viewModel.deleteAndStopSeries(id: row.id) {
+            show(feedback)
+        }
+    }
+
+    private func deleteCurrentOccurrence(_ row: TodoRowModel) {
+        Task {
+            if let feedback = await viewModel.deleteCurrentOccurrence(id: row.id) {
+                show(feedback)
+            }
+        }
+    }
+
+    /// 删除成功的 Toast：能撤销时挂一个「撤销」（3 秒，与 Toast 同寿）。
+    private func show(_ feedback: TodoDeletionFeedback) {
+        guard feedback.canUndo else {
+            toast = ToastItem(message: feedback.message)
+            return
+        }
+        toast = ToastItem(message: feedback.message, actionTitle: "撤销") {
+            Task {
+                if let message = await viewModel.undoDeletion() {
+                    toast = ToastItem(message: message)
+                }
+            }
         }
     }
 

@@ -43,6 +43,12 @@ struct EntryRowModel: Identifiable, Hashable, Sendable {
     let categoryID: UUID?
     let accountID: UUID?
     let toAccountID: UUID?
+    /// 是否为「待确认」的订阅账目（V1.1 F-SUB-13）。
+    ///
+    /// 是 `let`（行模型是不可变值类型），但 **init 里必须带默认值**：
+    /// 这个显式 init 被 30+ 个既有测试用全参数调用，新形参不给默认值不是断言失败，
+    /// 而是**整个测试 target 编译不过**。
+    let isPending: Bool
 
     /// 从模型拍成值类型。
     init(entry: LedgerEntry) {
@@ -56,6 +62,7 @@ struct EntryRowModel: Identifiable, Hashable, Sendable {
         categoryID = entry.category?.id
         accountID = entry.account?.id
         toAccountID = entry.toAccount?.id
+        isPending = entry.isPending
         accountName = entry.account?.displayName ?? "账户已删除"
         toAccountName = entry.toAccount?.displayName
 
@@ -91,7 +98,8 @@ struct EntryRowModel: Identifiable, Hashable, Sendable {
         createdAt: Date = Date(timeIntervalSince1970: 0),
         categoryID: UUID? = nil,
         accountID: UUID? = nil,
-        toAccountID: UUID? = nil
+        toAccountID: UUID? = nil,
+        isPending: Bool = false
     ) {
         self.id = id
         self.type = type
@@ -108,6 +116,7 @@ struct EntryRowModel: Identifiable, Hashable, Sendable {
         self.categoryID = categoryID
         self.accountID = accountID
         self.toAccountID = toAccountID
+        self.isPending = isPending
     }
 
     /// 金额色调。
@@ -167,10 +176,28 @@ struct GlanceModel: Hashable, Sendable {
     let subscriptionCount: Int
     /// 7 天内要扣的金额合计。
     let subscriptionTotal: Money
+    /// 「待确认」账目的笔数（V1.1 F-SUB-13）。
+    let pendingCount: Int
+    /// 「待确认」账目的金额合计。
+    ///
+    /// 这两个值只用于在"较上月"卡上补一行「含待确认 3 笔 ¥68.00」，
+    /// **不参与**首页大数字的计算（PRD 2.3-1 与 Q1：pending 已计入月度合计，
+    /// 再叠加一次就等于把同一笔钱说了两遍）。
+    let pendingAmount: Money
 
-    static let empty = GlanceModel(todoCount: 0, subscriptionCount: 0, subscriptionTotal: .zero)
+    static let empty = GlanceModel(
+        todoCount: 0,
+        subscriptionCount: 0,
+        subscriptionTotal: .zero,
+        pendingCount: 0,
+        pendingAmount: .zero
+    )
 
     /// 两项都为空时整条隐藏（R-LIST-1：没内容就不要留一块空白）。
+    ///
+    /// **`pending` 不计入 `isEmpty`**：待确认走的是"较上月"卡上的追加行，
+    /// 不是这条速览条。若把 pending 也算进来，一个只有待确认、没有待办也没有
+    /// 即将扣费的账本会凭空多出一条速览，而那条速览里没有任何可点的东西。
     var isEmpty: Bool { todoCount == 0 && subscriptionCount == 0 }
 }
 
@@ -528,10 +555,22 @@ final class LedgerHomeViewModel {
             .map(SubscriptionMapper.snapshot(of:))) ?? []
         let upcoming = SubscriptionOverview.upcoming(snapshots, today: today, within: 7)
 
+        // 待确认统计：走 `LedgerService.pendingSummary()` 而不是在这里再写一遍
+        // "哪些算 pending"的筛选逻辑——两处各写一份，界面和"一次性确认"按钮
+        // 迟早会数出不同的笔数（V1.1 F-SUB-13）。
+        var pendingCount = 0
+        var pendingAmount = Money.zero
+        if let summary = try? environment.ledger.pendingSummary() {
+            pendingCount = summary.count
+            pendingAmount = summary.amount
+        }
+
         return GlanceModel(
             todoCount: todoCount,
             subscriptionCount: upcoming.count,
-            subscriptionTotal: SubscriptionOverview.upcomingTotal(upcoming)
+            subscriptionTotal: SubscriptionOverview.upcomingTotal(upcoming),
+            pendingCount: pendingCount,
+            pendingAmount: pendingAmount
         )
     }
 

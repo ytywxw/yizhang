@@ -27,7 +27,21 @@ struct YiZhangApp: App {
         PerfProbe.markAppStart()
         #endif
         do {
+            // UI 测试用开关：传 `-YIZHANG_UITEST 1` 时切内存库。
+            //
+            // 为什么必须走内存库：磁盘库在两次 `XCUIApplication.launch()` 之间不清空，
+            // 第一遍造的账目 / 模板会留到第二遍，用例之间只能靠"谁先跑"决定成败。
+            // 内存库保证每次冷启动都是一张白纸，确定性留在测试自身，不必依赖 CI 前置脚本
+            // （`simctl uninstall` 那种活在配置里的清理一旦被删，症状是随机红，和真 bug 一模一样）。
+            //
+            // 仍然复用既有的 `make(inMemory:)`——它本来就被 `ModelContainerTests` 覆盖，
+            // 这里只是给它接线，不新增未测试的生产面。Release 构建里整段不存在。
+            #if DEBUG
+            let inMemory = UserDefaults.standard.bool(forKey: "YIZHANG_UITEST")
+            let container = try ModelContainerFactory.make(inMemory: inMemory)
+            #else
             let container = try ModelContainerFactory.make()
+            #endif
             let env = try AppEnvironment(container: container)
             _environment = State(initialValue: env)
             _bootstrapError = State(initialValue: nil)

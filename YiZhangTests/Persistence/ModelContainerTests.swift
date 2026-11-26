@@ -39,10 +39,26 @@ final class ModelContainerTests: XCTestCase {
     func testSchemaV1DeclaresSixModels() async throws {
         XCTAssertEqual(SchemaV1.models.count, 6)
         XCTAssertEqual(SchemaV1.versionIdentifier, Schema.Version(1, 0, 0))
+
+        // 这里曾经改成 `stages.count == 1`（团队想把 V1 → V2 写成显式 lightweight），
+        // 但那个写法在本工程里**必然崩溃**，实测报错原文：
+        //   'NSInvalidArgumentException', reason: 'Duplicate version checksums detected.'
+        // 原因是 `SchemaV1` 与 `SchemaV2` 引用同一批当前 `@Model` 类，而
+        // `Category.templates` / `Account.templates` 的 `inverse:` 指向 `EntryTemplate`，
+        // SwiftData 生成 V1 的 CoreData 模型时会把该实体一并拉进来，两版校验和因此完全相同。
+        // 详细探针矩阵见 `SchemaV1.swift` 文件头注释。
+        //
+        // 所以 `stages` 保持空，由 SwiftData 做隐式轻量迁移；这条断言的作用是**哨兵**：
+        // 哪天有人要让本工程走非轻量迁移（`.custom`），它会先变红，不会悄悄上线。
         XCTAssertTrue(YiZhangMigrationPlan.stages.isEmpty)
 
-        let schema = Schema(versionedSchema: SchemaV1.self)
-        XCTAssertEqual(Diagnostics.check(schema: schema).modelCount, 6)
+        // 结构自检口径已切到 `SchemaV2`（7 个模型，含 `EntryTemplate`）：
+        // 这里比的是"报告里的模型数量"与"V2 声明的模型数量"，不再是字面量 6 ——
+        // 于是再加模型时不需要改测试。
+        // 注意 `Diagnostics.check(schema:)` 返回的就是 `schema.entities.count`，
+        // 因此待检查的 schema 必须是 `SchemaV2`（用 V1 构造会得到 6，与 V2 的 7 不等）。
+        let schema = Schema(versionedSchema: SchemaV2.self)
+        XCTAssertEqual(Diagnostics.check(schema: schema).modelCount, SchemaV2.models.count)
     }
 
     func testInMemoryForPreviewIsUsable() async throws {
@@ -246,6 +262,8 @@ final class ModelContainerTests: XCTestCase {
         XCTAssertFalse(report.isHealthy)
         XCTAssertEqual(report.duplicateUniqueKeyCounts[duplicatedKey], 2)
         XCTAssertEqual(report.duplicateEntryCount, 2)
-        XCTAssertEqual(report.modelCount, 6)
+        // V1.1：自检口径已切到 `SchemaV2`（7 个模型，含 `EntryTemplate`），
+        // 所以这里不再写死 6，而是与 V2 的声明对齐。
+        XCTAssertEqual(report.modelCount, SchemaV2.models.count)
     }
 }

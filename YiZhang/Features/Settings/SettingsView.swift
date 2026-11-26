@@ -27,16 +27,23 @@ struct SettingsView: View {
 
     @State private var accountCount = 0
     @State private var categoryCount = 0
+    /// 模板条数（设置页「记账模板 3/20」）。
+    @State private var templateCount = 0
+    /// 回收站条数（V1.1）。**0 也要显示**：这一行本身就是"回收站是这个东西"的入口，
+    /// 条数为 0 就整行消失的话，用户永远找不到「最近删除」在哪。
+    @State private var trashCount = 0
     @State private var lockError: String?
     @State private var toast: ToastItem?
 
-    /// 三个二级页的 push 状态。
+    /// 四个二级页的 push 状态。
     ///
     /// 用 `navigationDestination(isPresented:)` 而不是 `NavigationLink { }`：
     /// 这样无头截图时可以用启动参数把页面推到指定状态（合成点击在 simctl 里做不到）。
     @State private var showsAccounts = false
     @State private var showsCategories = false
+    @State private var showsTemplates = false
     @State private var showsExport = false
+    @State private var showsTrash = false
     /// DEBUG 截图用：需要把列表滚到哪一段。
     @State private var demoScrollAnchor: String?
 
@@ -85,10 +92,24 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("settings.categories")
+
+                // 常用模板（V1.1 F-ACC-14）排在「分类」之后：
+                // 它消费的正是"分类 + 账户"这套组合，紧跟着它们才符合心智顺序。
+                Button {
+                    showsTemplates = true
+                } label: {
+                    settingsRow(
+                        icon: "square.grid.2x2.fill",
+                        title: "记账模板",
+                        detail: "\(templateCount)/\(TemplateService.limit)"
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settings.templates")
             } header: {
                 SectionHeaderView(title: "记账设置")
             } footer: {
-                Text("账户余额自动计算；分类支持隐藏与排序，预置分类不可删除。")
+                Text("账户余额自动计算；分类支持隐藏与排序，预置分类不可删除。记账模板是「记一笔」上方的快捷 chips，点一下就能填好常用组合。")
                     .font(Theme.Typography.caption)
             }
 
@@ -100,10 +121,20 @@ struct SettingsView: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("settings.export")
+
+                // 最近删除（V1.1）排在「导出数据」之后：它是数据区里唯一**可逆**的入口，
+                // 放在导出下面才能被"我想找回点什么"的人扫到。
+                Button {
+                    showsTrash = true
+                } label: {
+                    settingsRow(icon: "trash", title: "最近删除", detail: "\(trashCount) 条")
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settings.trash")
             } header: {
                 SectionHeaderView(title: "统计与数据")
             } footer: {
-                Text("导出的文件通过系统分享保存到「文件」App，或直接发给自己。")
+                Text("删除的账目会在「最近删除」里保留 \(TrashService.retentionDays) 天；导出的文件通过系统分享保存到「文件」App，或直接发给自己。")
                     .font(Theme.Typography.caption)
             }
 
@@ -183,12 +214,18 @@ struct SettingsView: View {
         .navigationDestination(isPresented: $showsCategories) {
             CategoryManageView()
         }
+        .navigationDestination(isPresented: $showsTemplates) {
+            TemplateManageView()
+        }
         .navigationDestination(isPresented: $showsExport) {
             ExportView(onGoToLedger: {
                 // 先退出二级页，再切 Tab：否则用户下次回「我的」还停在导出页。
                 showsExport = false
                 environment.selectedTab = .ledger
             })
+        }
+        .navigationDestination(isPresented: $showsTrash) {
+            TrashView()
         }
         .task {
             refreshCounts()
@@ -261,7 +298,7 @@ struct SettingsView: View {
 
     // MARK: - DEBUG 截图钩子
 
-    /// `-YIZHANG_OPEN_SETTINGS accounts|categories|export`：无头截图时直接推到二级页。
+    /// `-YIZHANG_OPEN_SETTINGS accounts|categories|export|trash`：无头截图时直接推到二级页。
     private func openSubScreenIfRequested() {
         #if DEBUG
         if let anchor = UserDefaults.standard.string(forKey: "YIZHANG_SCROLL_TO") {
@@ -271,7 +308,9 @@ struct SettingsView: View {
         switch target {
         case "accounts": showsAccounts = true
         case "categories", "categories-delete": showsCategories = true
+        case "templates": showsTemplates = true
         case "export": showsExport = true
+        case "trash": showsTrash = true
         default: break
         }
         #endif
@@ -288,6 +327,11 @@ struct SettingsView: View {
             QueryDescriptors.categories(of: .income)
         )) ?? 0
         categoryCount = expense + income
+        // 回收站条数用服务层算（`deletedDay > 0` 的整数谓词在那里是唯一真源，
+        // 这里再写一条 `#Predicate` 就有两处口径了）。
+        trashCount = (try? environment.trash.count()) ?? 0
+        // 模板条数用服务层算：上限判定（`canCreate`）就在那里，别在这儿再写一条 `fetchCount`
+        templateCount = (try? environment.template.count()) ?? 0
     }
 
     /// 打开应用锁要验证一次；关闭不验证。

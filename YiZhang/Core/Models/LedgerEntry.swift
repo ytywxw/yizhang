@@ -66,7 +66,28 @@ final class LedgerEntry {
     var updatedAt: Date = Date(timeIntervalSince1970: 0)
 
     /// 软删除时间（R-EDIT-3）。非 nil 表示已删除；撤销即把它置回 nil。
+    ///
+    /// ⚠️ **不要直接给本字段赋值**：软删有两个字段必须同进同出（本字段 + `deletedDay`），
+    /// 唯一合法的写法是 `LedgerWriter.markDeleted(_:at:)` / `LedgerWriter.unmarkDeleted(_:)`。
+    /// 绕过它们只写 `deletedAt` 会让「最近删除」按删除日分组与 30 天清理全部失效（风险 R1）。
     var deletedAt: Date? = nil
+
+    /// 删除日 `yyyyMMdd`，`0` = 未删除（V1.1 最近删除的整数谓词哨兵）。
+    ///
+    /// 为什么需要一个冗余的整数列（架构 D2 / PRD 6.3-7）：
+    /// ① iOS 17 的 `#Predicate` 对 `Optional<Date>` 的非等值比较（`!= nil` / `>` / `<`）有已知崩溃面，
+    ///    而「最近删除」必须按"删除日在最近 30 天内"筛选——用整数区间谓词既安全又不用 `Calendar`；
+    /// ② 按删除日分组（今天 / 昨天 / 11月18日）需要日键，从 `Date` 反算既慢又要时区。
+    ///
+    /// 与 `deletedAt` 的关系是**硬不变量**：非删除态两者分别为 `nil` / `0`；
+    /// 删除态两者同时有值。唯一写入点同 `deletedAt`（见其注释）。
+    var deletedDay: Int32 = 0
+
+    /// `EntryConfirmation` 的 raw 值：confirmed / pending（V1.1 F-SUB-13）。
+    ///
+    /// 默认 `"confirmed"` 是"只做加法"的落地方式：V1.0 的历史账目升级后**全部是已确认**，
+    /// 与升级前看到的界面完全一致，不会凭空冒出一堆待确认。
+    var confirmRaw: String = EntryConfirmation.confirmed.raw
 
     // MARK: - 关系（全部可选 + 反向关系在父端声明）
 
@@ -115,9 +136,11 @@ final class LedgerEntry {
         sourceRefID = draft.sourceRefID
         sourceCycleKey = draft.sourceCycleKey
         sourceCycleUniqueKey = draft.sourceCycleUniqueKey
+        // `nil` 的语义是"由业务层判定"，草稿没给判定时按字面量默认值落地（已确认）。
+        // 真正的 pending 判定发生在 `LedgerService.validated(_:)`（T2）。
+        confirmRaw = draft.confirmRaw ?? EntryConfirmation.confirmed.raw
         createdAt = now
         updatedAt = now
-        deletedAt = nil
     }
 
     // MARK: - 便捷计算属性（不参与持久化）
@@ -157,6 +180,23 @@ final class LedgerEntry {
 
     /// 是否计入统计（未软删）。
     var isActive: Bool { deletedAt == nil }
+
+    /// 账目确认状态（V1.1 F-SUB-13）。未知 raw 一律按已确认处理——
+    /// 宁可少打扰一次，也不要让一条老数据把界面变成"永远待确认"。
+    var confirmation: EntryConfirmation {
+        get { EntryConfirmation(raw: confirmRaw) ?? .confirmed }
+        set { confirmRaw = newValue.raw }
+    }
+
+    /// 是否为"待确认"（订阅自动生成、用户还没核对）。
+    ///
+    /// 注意它**不影响任何计算口径**：`isActive` / `isCountable` 与余额公式都不看这个字段。
+    var isPending: Bool { confirmRaw == EntryConfirmation.pending.raw }
+
+    /// 删除自然日；未删除时为 `nil`（`deletedDay == 0` 是哨兵）。
+    var deletedDate: DateOnly? {
+        deletedDay > 0 ? DateOnly(key: deletedDay) : nil
+    }
 
     /// 所属月份键 `yyyyMM`。
     var monthKey: Int32 { occurredDate.monthKey }

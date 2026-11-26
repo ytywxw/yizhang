@@ -177,6 +177,61 @@ final class LedgerHomeViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.glance.isEmpty, "没有待办也没有近期订阅 → 整条速览隐藏")
     }
 
+    // MARK: - ④b 待确认小计（V1.1 F-SUB-13 / PRD 2.4-1）
+
+    /// 首页「含待确认 1 笔 ¥25.00」的接线。
+    ///
+    /// 这条断言针对的是一个**静默失败**：`GlanceModel.pendingCount` 若某天被人
+    /// 删掉赋值（或 `makeGlance` 忘了传），首页会一直显示"没有待确认"，
+    /// 而全量测试仍然全绿——用户于是永远发现不了那笔等他核对的账。
+    func testGlanceReportsPendingCountAndAmount() throws {
+        let environment = try makeEnvironment()
+        _ = try addPendingEntry(amount: 2500, in: environment)
+
+        let viewModel = LedgerHomeViewModel(today: today)
+        viewModel.attach(environment)
+
+        XCTAssertEqual(viewModel.glance.pendingCount, 1, "PRD 2.4-1：首页要显示「含待确认 1 笔」")
+        XCTAssertEqual(
+            viewModel.glance.pendingAmount, Money(cents: 2500),
+            "金额必须与笔数同源（都来自 ledger.pendingSummary()）"
+        )
+    }
+
+    /// 没有待确认时必须真的是 0。
+    ///
+    /// 只有"有"的那条断言时，`pendingCount` 被写死成 `1` 也能过；
+    /// 加上这条，写死任何一个非零常量都会红。
+    func testGlanceReportsZeroPendingWhenNoneExists() throws {
+        let environment = try makeEnvironment()
+        try addEntry(day: today.key, amount: 2500, note: "手记一笔", in: environment)
+
+        let viewModel = LedgerHomeViewModel(today: today)
+        viewModel.attach(environment)
+
+        XCTAssertEqual(viewModel.glance.pendingCount, 0, "手动记账已确认，不是待确认")
+        XCTAssertEqual(viewModel.glance.pendingAmount, .zero)
+    }
+
+    /// 进回收站的待确认账目不能继续算在首页小计里（软删即"当前不存在"）。
+    func testGlanceExcludesSoftDeletedPendingEntry() throws {
+        let environment = try makeEnvironment()
+        let id = try addPendingEntry(amount: 2500, in: environment)
+        XCTAssertEqual(
+            try environment.ledger.pendingSummary().count, 1,
+            "前置条件：删之前确实有 1 笔待确认"
+        )
+
+        let entry = try XCTUnwrap(try environment.writer.entry(id: id))
+        try environment.writer.markDeleted(entry, at: today.date)
+
+        let viewModel = LedgerHomeViewModel(today: today)
+        viewModel.attach(environment)
+
+        XCTAssertEqual(viewModel.glance.pendingCount, 0, "回收站里的账不该继续催用户核对")
+        XCTAssertEqual(viewModel.glance.pendingAmount, .zero)
+    }
+
     // MARK: - ⑤ 月份切换
 
     func testMonthCannotGoBeyondCurrentMonth() throws {
@@ -254,6 +309,27 @@ final class LedgerHomeViewModelTests: XCTestCase {
 
         let outcome = try environment.ledger.create(draft)
         return try XCTUnwrap(outcome.entryID)
+    }
+
+    /// 造一笔**待确认**的订阅来源账目。
+    ///
+    /// `confirmRaw` 显式给 `pending` 而不是留 `nil` 让业务层判定：本用例测的是
+    /// "首页小计有没有接上 `pendingSummary()`"这条**接线**，不是"哪天算待确认"这条规则。
+    /// 规则由 `EntryConfirmationTests` 单独覆盖；这里若依赖 `todayProvider()` 的窗口，
+    /// 断言会随系统时钟漂移（真实今天是几号，决定 20261121 是否落在 7 天内）。
+    @discardableResult
+    private func addPendingEntry(amount: Int64, in environment: AppEnvironment) throws -> UUID {
+        var draft = EntryDraft(typeRaw: EntryType.expense.raw, amount: amount, occurredDay: today.key)
+        draft.sourceRaw = EntrySource.subscription.raw
+        draft.categoryID = try firstCategoryID(of: .expense, in: environment)
+        draft.accountID = try firstAccountID(in: environment)
+        draft.confirmRaw = EntryConfirmation.pending.raw
+        // 幂等键必须每次唯一，否则第二笔会被静默跳过（`InsertOutcome.skippedDuplicate`）
+        draft.sourceRefID = UUID()
+        draft.sourceCycleKey = "cycle-\(UUID().uuidString.prefix(8))"
+
+        let outcome = try environment.ledger.create(draft)
+        return try XCTUnwrap(outcome.entryID, "待确认账目没有落库")
     }
 
     private func addTodo(dueDay: Int32, in environment: AppEnvironment) throws {

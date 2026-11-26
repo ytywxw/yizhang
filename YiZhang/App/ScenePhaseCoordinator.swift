@@ -35,6 +35,9 @@ final class ScenePhaseCoordinator {
     /// 是否正在重算通知（同上）。
     private var isRescheduling = false
 
+    /// 是否正在清理回收站（同上，独立守卫：与扫描、通知互不相关）。
+    private var isPurgingTrash = false
+
     /// 最近一次自检的一行结论（DEBUG 日志 / 排查用）。
     private(set) var lastDiagnosticsSummary: String?
 
@@ -64,6 +67,10 @@ final class ScenePhaseCoordinator {
             Task { await rescheduleNotificationsIfNeeded() }
             // 启动自检（T23）：进程内只跑一次，与上面两件事并行
             Task { await runDiagnosticsIfNeeded() }
+            // 回收站过期清理（V1.1，PRD 6.2 的第一个挂载点）：
+            // 与上面三件事都无关，独立守卫、独立 Task。放 `Task` 里而不是同步调，
+            // 是因为它会做一次全回收站 fetch + 可能的硬删，不该占用首帧。
+            Task { purgeExpiredIfNeeded() }
         case .inactive, .background:
             // V1.0 不做后台任务（R-SUB-9）：没有需要在这里收尾的工作
             break
@@ -85,6 +92,33 @@ final class ScenePhaseCoordinator {
         defer { isSweeping = false }
 
         await performSweep()
+    }
+
+    // MARK: - 回收站清理（V1.1 接线）
+
+    /// 冷启动 / 回前台清理回收站里的过期项与超额项（PRD 6.2）。
+    ///
+    /// **best-effort**：`try?` 吞掉异常。清理失败的最坏后果是"过期项多留几天"，
+    /// 下次冷启动还会再试一次；反过来，在启动路径上为一次清理失败弹错误弹窗，
+    /// 代价远大于收益——用户根本没做任何操作。
+    ///
+    /// 为什么用独立守卫 `isPurgingTrash`：`sweepIfNeeded` 有自己的 `isSweeping`，
+    /// 共用同一个标志会让"扫描正在跑"静默变成"回收站不清理"，
+    /// 而这两件事的触发条件（前者看 `nextBillingDay`、后者看 `deletedDay`）毫无关系。
+    ///
+    /// ⚠️ **本守卫当前实际不可达**（不要以为它是死代码就删掉）：函数体全同步
+    /// （`trash.purgeExpired` 是同步 throwing 函数），且 `defer` 在返回前就复位标志，
+    /// 而 MainActor 上的两个同步调用**不可能交错**，所以 `guard !isPurgingTrash` 永远为假。
+    /// 它不像 `isSweeping` / `isRescheduling`——那两个内部 `await` 了异步操作，守卫是真的有效。
+    /// 保留它的唯一理由：一旦有人给清理加上 `await`（例如分批硬删、或改成后台优先级），
+    /// 并发重入会立刻变成真问题，而那时"这里没有守卫"的写法不会提醒他补；
+    /// 不对称的设计比暂时无用的守卫更危险。
+    func purgeExpiredIfNeeded() {
+        guard environment != nil, !isPurgingTrash else { return }
+        isPurgingTrash = true
+        defer { isPurgingTrash = false }
+
+        _ = try? environment?.trash.purgeExpired(today: DateOnly(Date()))
     }
 
     // MARK: - 通知重算（T20 接线）
@@ -118,7 +152,10 @@ final class ScenePhaseCoordinator {
     /// Release 构建里 `repair` 那段代码根本不存在——发布版**永远不会改用户数据**。
     ///
     /// 为什么只跑一次：它是"启动体检"，不是每小时巡逻。真要持续监控，
-    /// 代价是全表扫（1 万行 ~5ms），而为一个已经通过的检查反复扫没有任何收益。
+    /// 代价是全表扫（**1 万行 ≈200ms，实测**；2 000 行 ≈41ms —— 大头是 SwiftData
+    /// 逐行 materialize，不是我们的算法，口径见 `Diagnostics.swift` 文件头），
+    /// 而为一个已经通过的检查反复扫没有任何收益。这个数字比"5ms"更支持"只跑一次"这个决定。
+    /// （旧版本这里写的是"1 万行 ~5ms"，差了约 40 倍，已按实测更正。）
     func runDiagnosticsIfNeeded() async {
         guard let environment, !hasRunStartupChecks else { return }
         hasRunStartupChecks = true

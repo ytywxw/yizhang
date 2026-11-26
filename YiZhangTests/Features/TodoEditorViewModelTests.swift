@@ -284,7 +284,12 @@ final class TodoEditorViewModelTests: XCTestCase {
         )
         let editor = sut.editor(mode: .edit(id), today: today)
 
-        XCTAssertEqual(editor.delete(), "已删除待办")
+        // 已完成 + 不重复 → 「已删除待办」（与列表页 `delete(id:)` 的文案同口径）
+        let deleted = try XCTUnwrap(editor.deleteAndStopSeries(), "删除失败会返回 nil")
+        guard case .deleted(let message, _) = deleted else {
+            return XCTFail("删除路径必须返回 .deleted，而不是 .saved")
+        }
+        XCTAssertEqual(message, "已删除待办")
 
         XCTAssertNil(try sut.environment.todo.todo(id: id))
         XCTAssertEqual(try sut.entryCount(), 1, "删待办不删账：钱确实花出去了")

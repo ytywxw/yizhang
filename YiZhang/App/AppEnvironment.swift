@@ -13,7 +13,8 @@
 //  `dataVersion` 是"缓存失效信号"：任何写入提交后自增，统计页用 `.task(id: dataVersion)` 重新取数。
 //  为什么不用 `@Query` 直接刷新统计：统计需要聚合（不能直接绑 UI），且聚合必须限定区间。
 //
-//  已注册：`LedgerService`（T06）、`SubscriptionService` + `SweepCoordinator`（T10/T11）。
+//  已注册：`LedgerService`（T06）、`SubscriptionService` + `SweepCoordinator`（T10/T11）、
+//  `TodoService`（T15）、`TemplateService` + `TrashService`（V1.1 / T1）。
 //  其余 Service 的预留位置见「后续扩展」注释。
 //
 
@@ -81,6 +82,18 @@ final class AppEnvironment {
 
     /// scenePhase 协调器（冷启动扫描、自检的挂载点）。
     let sceneCoordinator: ScenePhaseCoordinator
+
+    /// 常用模板服务（V1.1 / F-ACC-14）。
+    ///
+    /// 与其它服务共用同一个 `writer`：模板的增删改与账目写入共享"一次 save = 一个事务"，
+    /// 于是"存为模板"这类复合动作不会出现半成品。
+    let template: TemplateService
+
+    /// 最近删除服务（V1.1 / 最近删除）。
+    ///
+    /// 持有 `subscription` 是为了恢复订阅账目时能回退抑制表（`unsuppress`）——
+    /// 这是 PRD 6.3-1 的硬要求，不是可选优化。
+    let trash: TrashService
 
     /// 设置行（单例，由 `SeedData` 幂等保证）。
     ///
@@ -195,6 +208,14 @@ final class AppEnvironment {
         // 3.7 应用锁（与数据无关，只读写 UserDefaults）
         self.appLock = AppLockService()
 
+        // 3.8 模板服务（V1.1）：与账目写入共用 writer，"存为模板"不会写出半成品
+        let templateService = TemplateService(writer: writer)
+        self.template = templateService
+
+        // 3.9 最近删除服务（V1.1）：恢复订阅账目时要回退抑制表，因此依赖 subscriptionService
+        let trashService = TrashService(writer: writer, subscription: subscriptionService)
+        self.trash = trashService
+
         // 4. 设置行
         let context = ModelContext(container)
         guard let loadedSettings = try context.fetch(QueryDescriptors.appSettings()).first else {
@@ -221,6 +242,29 @@ final class AppEnvironment {
         todoService.onDidCommit = { [weak self] in
             self?.bumpDataVersion()
         }
+        templateService.onDidCommit = { [weak self] in
+            self?.bumpDataVersion()
+        }
+        trashService.onDidCommit = { [weak self] in
+            self?.bumpDataVersion()
+        }
+
+        // 6.1 每次软删之后清一次回收站（PRD 6.2 的第二个挂载点）。
+        //
+        // 三个 Service 各自只有一个软删入口（`LedgerService.delete`、
+        // `SubscriptionService.denyEntry`、`TodoService.reopen(keepEntry: false)`），
+        // 全部接到同一个钩子：过期项只可能由"时间"产生，但容量兜底（> 500 条）
+        // 需要每次删除后重算，两条逻辑在 `purgeExpired` 里本来就是一件事。
+        //
+        // **best-effort**：`try?` 吞掉异常。清理失败最多让过期项多留到下次冷启动，
+        // 绝不能因为它把用户刚才的删除动作变成一次失败的写入。
+        let purgeExpiredTrash: () -> Void = { [weak self] in
+            guard let self else { return }
+            _ = try? self.trash.purgeExpired(today: DateOnly(Date()))
+        }
+        ledgerService.onDidSoftDelete = purgeExpiredTrash
+        subscriptionService.onDidSoftDelete = purgeExpiredTrash
+        todoService.onDidSoftDelete = purgeExpiredTrash
 
         // 7. 开发期演示数据（仅 DEBUG，且必须显式传启动参数；详见 `DebugDemoData`）
         #if DEBUG
@@ -235,6 +279,10 @@ final class AppEnvironment {
             writer: writer
         )
         DebugDemoData.seedTodosIfRequested(todo: todoService)
+        // UI 测试专用：chips 与删除弹层都需要"非空数据"才可达
+        // （`TemplateChipsRow` 空模板整行不渲染；删除弹层全部门禁在 `isRepeating` 上）
+        DebugDemoData.seedTemplatesIfRequested(template: templateService, writer: writer)
+        DebugDemoData.seedRepeatingTodosIfRequested(todo: todoService, writer: writer)
         #endif
     }
 

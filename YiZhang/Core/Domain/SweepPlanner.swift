@@ -132,7 +132,14 @@ enum SweepPlanner {
                         accountID: snapshot.accountID,
                         cycleKey: cycleKey,
                         uniqueKey: uniqueKey,
-                        nextBillingDayAfter: nextDay.key
+                        nextBillingDayAfter: nextDay.key,
+                        // F-SUB-13：窗口判定用**应扣日**（`cursor.key`，不是今天）。
+                        // `today` 是本函数的入参，所以这里天然满足架构 R7（不许读系统时钟）：
+                        // 冷启动补漏 60 天前的账目时，它们一律 `confirmed`。
+                        confirmRaw: EntryConfirmation.forSubscription(
+                            occurredDay: cursor.key,
+                            today: today
+                        ).raw
                     )
                 )
                 scheduledNextDay = nextDay.key

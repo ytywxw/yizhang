@@ -41,6 +41,16 @@ final class StatisticsViewModel {
     }
 
     private(set) var snapshot: StatisticsSnapshot = .empty()
+
+    /// 同比 / 环比（V1.1 F-ACC-16）。本年档 `mom == nil`。
+    private(set) var comparison: StatisticsComparison = .empty
+    /// 对比用到的那三个区间（卡片上要写清"和哪一段比"）。
+    private(set) var comparisonBounds: PeriodComparisonBounds = .empty
+    /// 账户构成（已排序、已合并）。
+    private(set) var accountShares: [AccountShare] = []
+    /// 被合并进「其他」的账户 id（下钻时用来精确筛选，而不是"显示全部"）。
+    private(set) var mergedAccountIDs: Set<UUID> = []
+
     private(set) var errorMessage: String?
     private(set) var isLoaded = false
 
@@ -50,6 +60,14 @@ final class StatisticsViewModel {
     private(set) var categoryIcons: [UUID: String] = [:]
     /// 分类 id → 颜色。
     private(set) var categoryColors: [UUID: String] = [:]
+
+    /// 账户 id → 名称（账户构成卡用）。
+    private(set) var accountNames: [UUID: String] = [:]
+    /// 已归档的账户 id（行尾灰字「已归档」）。
+    ///
+    /// 为什么单独存一个集合而不是"名称里加后缀"：
+    /// 名称要能被下钻页复用（标题就是账户名），把状态揉进字符串会让筛选/去重全变成字符串比较。
+    private(set) var archivedAccountIDs: Set<UUID> = []
 
     /// 折线图上被选中的日（1…31）；nil = 没选中。
     var selectedDay: Int?
@@ -81,6 +99,7 @@ final class StatisticsViewModel {
     func attach(_ environment: AppEnvironment) {
         self.environment = environment
         loadCategoryLookup(environment)
+        loadAccountLookup(environment)
         reload()
     }
 
@@ -97,6 +116,25 @@ final class StatisticsViewModel {
                 today: today,
                 metric: metric
             )
+            // 同比环比与账户构成跟 `snapshot` 用同一批 `entries`、同一档 `range`/`metric`，
+            // 于是"两卡之和 == 合计"不靠约定，靠输入完全相同
+            comparison = StatisticsComparison(
+                StatisticsCalculator.comparison(
+                    entries,
+                    range: range,
+                    metric: metric,
+                    today: today
+                )
+            )
+            comparisonBounds = StatisticsCalculator.comparisonBounds(range: range, today: today)
+            let accounts = StatisticsCalculator.accountShares(
+                entries,
+                range: range,
+                metric: metric,
+                today: today
+            )
+            accountShares = accounts.shares
+            mergedAccountIDs = accounts.mergedIDs
             let afterAggregate = CFAbsoluteTimeGetCurrent()
             loadedEntryCount = entries.count
             lastFetchMilliseconds = (afterFetch - started) * 1000
@@ -105,6 +143,10 @@ final class StatisticsViewModel {
         } catch {
             errorMessage = "统计数据读取失败：\(error.localizedDescription)。切一下时间范围可以重算。"
             snapshot = .empty(range: range, metric: metric)
+            comparison = .empty
+            comparisonBounds = .empty
+            accountShares = []
+            mergedAccountIDs = []
             loadedEntryCount = 0
         }
         lastLoadMilliseconds = (CFAbsoluteTimeGetCurrent() - started) * 1000
@@ -147,6 +189,30 @@ final class StatisticsViewModel {
         }
     }
 
+    /// 账户名称 / 归档状态查表（只做一次；账户很少变）。
+    ///
+    /// **必须含归档账户**：本档有账目的归档账户仍要显示（行尾标「已归档」），
+    /// 本档没有账目的归档账户自然不会有桶，不需要额外过滤——
+    /// 用 `includeArchived: false` 会让"上个月还有一笔、这个月归档了"的账户整个消失，
+    /// 用户会以为那笔账丢了。
+    private func loadAccountLookup(_ environment: AppEnvironment) {
+        do {
+            let accounts = try environment.readContext.fetch(QueryDescriptors.accounts())
+            var names: [UUID: String] = [:]
+            var archived = Set<UUID>()
+            for account in accounts {
+                names[account.id] = account.name
+                if account.isArchived { archived.insert(account.id) }
+            }
+            accountNames = names
+            archivedAccountIDs = archived
+        } catch {
+            // 查表失败不该挡住图表：名称会退化成「已删除账户」，归档标记会消失
+            accountNames = [:]
+            archivedAccountIDs = []
+        }
+    }
+
     /// 取全部账目 → `LedgerLite`。
     ///
     /// 只取需要的区间（近 6 个月 + 本年）会让本类出现第二套日期口径，
@@ -186,6 +252,72 @@ final class StatisticsViewModel {
     func colorHex(for share: CategoryShare) -> String {
         guard let id = share.categoryID else { return "#9E9E9E" }
         return categoryColors[id] ?? "#9E9E9E"
+    }
+
+    // MARK: - 展示辅助（账户构成，V1.1 F-ACC-16）
+
+    /// 账户行标题：合并桶 → 「其他」；无账户 → 「未知账户」；查不到名 → 「已删除账户」。
+    ///
+    /// 「查不到名」与「无账户」必须是两种文案：前者是"账户被删了但账目还在"（历史数据），
+    /// 后者是"记账时就没选账户"。都写「未知账户」会让用户没法判断该不该去补一条账户。
+    func title(for share: AccountShare) -> String {
+        if share.isMerged { return "其他" }
+        guard let id = share.accountID else { return "未知账户" }
+        return accountNames[id] ?? "已删除账户"
+    }
+
+    /// 归档账户（行尾灰字「已归档」）；合并桶与无账户永远不是归档。
+    func isArchived(_ share: AccountShare) -> Bool {
+        guard let id = share.accountID else { return false }
+        return archivedAccountIDs.contains(id)
+    }
+
+    /// 这一条能不能下钻。
+    ///
+    /// - 「其他」：`mergedIDs` 非空才可下钻（空集合下钻会筛出 0 条，比不可点更糟）。
+    /// - 「未知账户」：**不可下钻**。`EntryFilter.accountIDs` 表达不了 `nil`，
+    ///   硬凑一个空集合会被判成"不过滤"，结果筛出全部账目——那是在撒谎。
+    /// - 真实账户：可下钻。
+    func canDrill(into share: AccountShare) -> Bool {
+        if share.isMerged { return !mergedAccountIDs.isEmpty }
+        return share.accountID != nil
+    }
+
+    /// 下钻要带的账户 id 集合。
+    func drillAccountIDs(for share: AccountShare) -> Set<UUID> {
+        if share.isMerged { return mergedAccountIDs }
+        guard let id = share.accountID else { return [] }
+        return [id]
+    }
+
+    // MARK: - 展示辅助（同比环比）
+
+    /// 对比卡的副标题：「本月至今 · 与去年同月、上月同期比」。
+    ///
+    /// 这句话不是装饰：卡片上有两个 chip，用户必须一眼看出"和哪两段比"，
+    /// 否则会拿去年整月的心智去读一个"去年同月 1–20 日"的数字。
+    var comparisonSubtitle: String {
+        let current = ComparisonCopy.currentCaption(range)
+        let yoy = ComparisonCopy.baselineCaption(slot: .yearOverYear, range: range)
+        switch range {
+        case .thisYear:
+            // 本年档没有环比（任务书 §2），副标题也不能提"环比"
+            return "\(current) · 与\(yoy)比"
+        case .thisMonth, .lastMonth:
+            let mom = ComparisonCopy.baselineCaption(slot: .monthOverMonth, range: range)
+            return "\(current) · 与\(yoy)、\(mom)比"
+        }
+    }
+
+    /// 对比卡是不是整张空（当期与两个基线都没有金额）。
+    ///
+    /// 只在**全都为 0** 时算空：当期 0、基线有数时必须照常显示「¥0.00 ▼100%」——
+    /// 那是"这个月一分钱没花"，是一个有信息量的结论，不能藏进空态。
+    var isComparisonEmpty: Bool {
+        guard comparison.current.cents == 0 else { return false }
+        if comparison.yoy.baseline.cents > 0 { return false }
+        if let mom = comparison.mom, mom.baseline.cents > 0 { return false }
+        return true
     }
 
     /// 折线图当前选中的点（跟随 `selectedDay`）。

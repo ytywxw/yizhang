@@ -32,7 +32,18 @@ struct TodoRowView: View {
     var onPostpone: (() -> Void)?
 
     /// 「⋯」→ 删除。
+    ///
+    /// 语义随行状态变化（见 `menu(onDelete:)`）：
+    /// - 已完成 → 「删除这条记录」（只删记录，不动重复设置）；
+    /// - 未完成 + 非重复 → 「删除」；
+    /// - 未完成 + 重复 → 不出这一项，改出下面两个。
     var onDelete: (() -> Void)?
+
+    /// 「⋯」→ 删除这一期（未完成 + 重复才有；系列继续）。
+    var onDeleteCurrentOccurrence: (() -> Void)?
+
+    /// 「⋯」→ 删除此次及以后（未完成 + 重复才有；系列到此为止）。
+    var onDeleteAndStopSeries: (() -> Void)?
 
     var body: some View {
         HStack(alignment: dynamicTypeSize.isAccessibilitySize ? .top : .center,
@@ -67,10 +78,25 @@ struct TodoRowView: View {
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
         .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("todo.row")
+        .accessibilityIdentifier(accessibilityID)
     }
 
     // MARK: - 组成
+
+    /// 行内标识符的公共后缀：`<标题>.<未完成 open / 已完成 done>`。
+    ///
+    /// 为什么必须带状态：重复待办完成时 `TodoService.complete` 会 spawn 下一期，
+    /// 而新一期的**标题和刚完成那条完全相同**（一份已完成、一份未完成）。只用标题做后缀时
+    /// 两行会撞成同一个标识符，UI 测试只能退回 `element(boundBy:)` 按行序取——
+    /// 种子顺序一改就全错，第二个维护的人会直接把测试删掉。
+    ///
+    /// 标识符是给测试用的，不是给用户看的：这里用标题而不是 UUID，
+    /// 是因为测试必须能在不知道 id 的前提下写出 `todo.row.menu.续费会员.done` 这种可读的定位。
+    private var axSuffix: String {
+        "\(row.title).\(row.isDone ? "done" : "open")"
+    }
+
+    private var accessibilityID: String { "todo.row.\(axSuffix)" }
 
     private var checkbox: some View {
         Button(action: onToggle) {
@@ -82,7 +108,7 @@ struct TodoRowView: View {
         }
         .buttonStyle(.borderless)
         .accessibilityLabel(Text(row.isDone ? "撤销完成「\(row.title)」" : "完成「\(row.title)」"))
-        .accessibilityIdentifier("todo.row.checkbox")
+        .accessibilityIdentifier("todo.row.checkbox.\(axSuffix)")
     }
 
     private var titleLine: some View {
@@ -141,15 +167,46 @@ struct TodoRowView: View {
             .accessibilityLabel(Text("这条待办来自订阅"))
     }
 
+    /// 「⋯」菜单：三分支（V1.1 / F-TODO-11）。
+    ///
+    /// | 行状态 | 菜单项 |
+    /// | --- | --- |
+    /// | 未完成 + 重复 | 移到明天 / 删除这一期 / 删除此次及以后 |
+    /// | 未完成 + 不重复 | 移到明天 / 删除 |
+    /// | 已完成 | 删除这条记录（**只有这一项**，且不碰重复设置） |
+    ///
+    /// 为什么已完成的重复待办**不能**出「删除此次及以后」：那条历史记录是"我已经做过了"
+    /// 的证据，删它不该产生"以后也不做了"的副作用。两个语义放同一个按钮里，
+    /// 用户点完才发现系列被终止了 —— 这是删数据里最难挽回的一种误操作。
     private func menu(onDelete: @escaping () -> Void) -> some View {
         Menu {
-            if !row.isDone, let onPostpone {
-                Button(action: onPostpone) {
-                    Label("移到明天", systemImage: "calendar.badge.clock")
+            if row.isDone {
+                Button(role: .destructive, action: onDelete) {
+                    Label("删除这条记录", systemImage: "trash")
                 }
-            }
-            Button(role: .destructive, action: onDelete) {
-                Label("删除", systemImage: "trash")
+            } else {
+                if let onPostpone {
+                    Button(action: onPostpone) {
+                        Label("移到明天", systemImage: "calendar.badge.clock")
+                    }
+                }
+
+                if row.isRepeating {
+                    if let onDeleteCurrentOccurrence {
+                        Button(role: .destructive, action: onDeleteCurrentOccurrence) {
+                            Label("删除这一期", systemImage: "calendar.badge.minus")
+                        }
+                    }
+                    if let onDeleteAndStopSeries {
+                        Button(role: .destructive, action: onDeleteAndStopSeries) {
+                            Label("删除此次及以后", systemImage: "trash.slash")
+                        }
+                    }
+                } else {
+                    Button(role: .destructive, action: onDelete) {
+                        Label("删除", systemImage: "trash")
+                    }
+                }
             }
         } label: {
             Image(systemName: "ellipsis.circle")
@@ -159,7 +216,7 @@ struct TodoRowView: View {
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(Text("更多操作"))
-        .accessibilityIdentifier("todo.row.menu")
+        .accessibilityIdentifier("todo.row.menu.\(axSuffix)")
     }
 }
 

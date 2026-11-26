@@ -33,8 +33,18 @@ struct LedgerLite: Hashable, Sendable {
     let accountID: UUID?
     /// `EntrySource` 的 raw 值。
     let sourceRaw: String
+    /// `EntryConfirmation` 的 raw 值（V1.1）。默认 `confirmed`，
+    /// 于是所有既有构造点（含 5 处测试）无需改动即可编译。
+    let confirmRaw: String
+    /// 删除标记（`nil` = 未删除）。V1.1 起与模型层共用同一个 `DeletionMark`，
+    /// 于是"时刻有值、日键为 0"这种半删除态在值类型层面同样不可表达。
+    private let deletion: DeletionMark?
+
     /// 软删除时间（非 nil 表示已删除，统计时必须排除）。
-    let deletedAt: Date?
+    var deletedAt: Date? { deletion?.at }
+
+    /// 软删除日 `yyyyMMdd`（`0` = 未删除），回收站分组与过期判定用。
+    var deletedDay: Int32 { deletion?.day ?? 0 }
 
     init(
         id: UUID,
@@ -44,6 +54,7 @@ struct LedgerLite: Hashable, Sendable {
         categoryID: UUID? = nil,
         accountID: UUID? = nil,
         sourceRaw: String = EntrySource.manual.raw,
+        confirmRaw: String = EntryConfirmation.confirmed.raw,
         deletedAt: Date? = nil
     ) {
         self.id = id
@@ -53,12 +64,19 @@ struct LedgerLite: Hashable, Sendable {
         self.categoryID = categoryID
         self.accountID = accountID
         self.sourceRaw = sourceRaw
-        self.deletedAt = deletedAt
+        self.confirmRaw = confirmRaw
+        self.deletion = deletedAt.map { DeletionMark(at: $0) }
     }
 
     var type: EntryType { EntryType(raw: typeRaw) ?? .expense }
 
     var source: EntrySource { EntrySource(raw: sourceRaw) ?? .manual }
+
+    /// 确认状态（未知 raw 按已确认处理，理由同 `LedgerEntry.confirmation`）。
+    var confirmation: EntryConfirmation { EntryConfirmation(raw: confirmRaw) ?? .confirmed }
+
+    /// 是否为待确认（仅标记，不影响任何聚合口径）。
+    var isPending: Bool { confirmRaw == EntryConfirmation.pending.raw }
 
     var occurredDate: DateOnly { DateOnly(key: occurredDay) }
 
@@ -229,6 +247,13 @@ struct EntryDraft: Hashable, Sendable {
     /// 幂等键 `"<sourceRefID>|<cycleKey>"`，手动记账为 nil。
     var uniqueKey: String?
 
+    /// `EntryConfirmation` 的 raw 值；`nil` = **由业务层判定**（V1.1 F-SUB-13）。
+    ///
+    /// 为什么是可选的：草稿是"用户/系统想记的账"，而"这一笔该不该是待确认"是一个业务规则，
+    /// 唯一实现位置是 `LedgerService.validated(_:)`（订阅来源 + 应扣日在最近 7 天内 → pending）。
+    /// 若这里给 `"confirmed"` 默认值，调用方就永远拿不到"没判定过"这个信息，规则会被复制到各处。
+    var confirmRaw: String?
+
     var type: EntryType { EntryType(raw: typeRaw) ?? .expense }
 
     var source: EntrySource { EntrySource(raw: sourceRaw) ?? .manual }
@@ -268,6 +293,16 @@ struct SweepAction: Hashable, Sendable {
     /// 该期之后的下次扣费日。多期补漏时，**最后一条** action 的值就是最终值。
     let nextBillingDayAfter: Int32
 
+    /// `EntryConfirmation` 的 raw 值（V1.1 F-SUB-13）；`nil` = 由 `draft` 的默认行为决定。
+    ///
+    /// **必须是 `var` 且带默认值**：Swift 会把"带默认值的 `let` 存储属性"从 memberwise
+    /// init 里**剔除**，那样这个字段将永远设不进去（编译器不报错，才是最难查的那种 bug）。
+    /// 带默认值则既让新字段可选、又不破坏任何既有构造点。
+    ///
+    /// 值由 `SweepPlanner` 用 `EntryConfirmation.forSubscription(occurredDay:today:)` 算好
+    /// 传进来——规则本体只有一处，这里只负责携带，不重新判定。
+    var confirmRaw: String? = nil
+
     /// 转成写入用的草稿（`occurredDay` 用应扣日，来源字段一次写全）。
     var draft: EntryDraft {
         var draft = EntryDraft(
@@ -282,6 +317,9 @@ struct SweepAction: Hashable, Sendable {
         draft.sourceRefID = subscriptionID
         draft.sourceCycleKey = cycleKey
         draft.uniqueKey = uniqueKey
+        // F-SUB-13：扫描路径同样要带上确认状态（规则本体在 `EntryConfirmation` 扩展里，
+        // 这里只透传 `SweepPlanner` 算好的结果）。谁都不许在这里二次判定。
+        draft.confirmRaw = confirmRaw
         return draft
     }
 

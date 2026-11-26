@@ -147,7 +147,32 @@ struct EntryRowView: View {
                 showsSign: row.type.isIncome
             )
             .lineLimit(1)
+
+            // 「待确认」徽标（V1.1 F-SUB-13）贴在金额**右侧**：
+            // 用户的阅读动线是"分类 → 金额"，徽标紧跟金额才能把"这笔还没核对"和
+            // 具体那一笔绑在一起。放到左边（分类前）会被图标和分类名隔开，
+            // 视线跳过去就等于另一个来源的标记了。
+            if row.isPending {
+                pendingBadge
+            }
         }
+    }
+
+    /// 琥珀色「待确认」胶囊。
+    ///
+    /// 与 `sourceBadge`（灰色来源徽章）的区别只在颜色与位置：来源说的是"这笔从哪来"，
+    /// 确认状态说的是"这笔对不对"，两者可以同时出现，所以不能合并成一个徽章。
+    private var pendingBadge: some View {
+        Text("待确认")
+            .font(Theme.Typography.caption)
+            .foregroundStyle(Theme.Semantic.pending)
+            .padding(.horizontal, Theme.Spacing.xxs)
+            .padding(.vertical, 1)
+            .background(
+                Theme.Semantic.pending.opacity(0.14),
+                in: Capsule(style: .continuous)
+            )
+            .accessibilityHidden(true) // 已并入整行的 `accessibilityText`
     }
 
     private var sourceBadge: some View {
@@ -174,6 +199,7 @@ struct EntryRowView: View {
         if !row.note.isEmpty { parts.append(row.note) }
         parts.append(accountText)
         parts.append(row.type.isIncome ? "收入\(row.amount.accessibilityText)" : row.amount.accessibilityText)
+        if row.isPending { parts.append("待确认") }
         if row.source.needsBadge { parts.append("来自\(row.source.displayName)") }
         return parts.joined(separator: "，")
     }
@@ -225,7 +251,8 @@ struct EntryRowView: View {
                 colorHex: "#00838F",
                 accountName: "微信",
                 source: .subscription,
-                day: today
+                day: today,
+                isPending: true
             ),
             isHighlighted: true
         )

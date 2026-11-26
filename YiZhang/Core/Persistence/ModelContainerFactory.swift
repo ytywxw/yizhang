@@ -5,10 +5,15 @@
 //  职责：全项目唯一的 ModelContainer 创建点。
 //
 //  一个 `bool` 开关决定是否接 iCloud 私有库：
-//  - V1.0：`cloudKitEnabled = false` → `.none`（纯本地，无需 entitlement）
-//  - V1.1：改成 true → `.automatic`（schema 不变，零迁移）
+//  - V1.0 / V1.1：`cloudKitEnabled = false` → `.none`（纯本地，无需 entitlement）
+//  - 后续开同步：改成 true → `.automatic`（schema 不变，零迁移）
 //
 //  这就是"从第一天就是 CloudKit 形状"的收益：开同步只改一行常量。
+//
+//  V1.1 起本文件用 `SchemaV2` + `YiZhangMigrationPlan`（V1 → V2 一段轻量迁移）。
+//  V1.0 时代这里的注释写着"V2 时容器创建代码零改动"，那句话是错的：
+//  版本一变，`Schema(versionedSchema:)` 的入参和 `ModelContainer(for:migrationPlan:configurations:)`
+//  都必须跟着改，否则旧库会打不开。此处已按事实改写，别再被旧注释误导。
 //
 //  iOS 17 的真实限制（架构 §3.4）：`#Index` 宏是 iOS 18 引入的，V1.0 无法声明自定义索引。
 //  因此索引声明以注释形式预留在本文件末尾，抬到 iOS 18 只需取消注释，业务代码零改动。
@@ -29,14 +34,23 @@ enum ModelContainerFactory {
     ///
     /// - Parameter inMemory: `true` 时使用内存库（单元测试 / 预览），不写磁盘。
     /// - Returns: 可用的 `ModelContainer`。
+    ///
+    /// - Note: 用的是**最新** schema（`SchemaV2`），并显式带上 `YiZhangMigrationPlan`。
+    ///   两者必须成对出现：只换 schema 不带迁移计划，旧库会因"元数据版本对不上"直接打开失败；
+    ///   带了迁移计划，SwiftData 才会按 `stages` 里的轻量迁移把旧库原地升级（补两列 + 建模板表）。
+    ///   V1.0 的注释说"V2 时容器创建代码零改动"是**错的**——注释已按事实改写。
     static func make(inMemory: Bool = false) throws -> ModelContainer {
-        let schema = Schema(versionedSchema: SchemaV1.self)
+        let schema = Schema(versionedSchema: SchemaV2.self)
         let configuration = ModelConfiguration(
             schema: schema,
             isStoredInMemoryOnly: inMemory,
             cloudKitDatabase: cloudKitEnabled ? .automatic : .none
         )
-        return try ModelContainer(for: schema, configurations: [configuration])
+        return try ModelContainer(
+            for: schema,
+            migrationPlan: YiZhangMigrationPlan.self,
+            configurations: [configuration]
+        )
     }
 
     /// 预览 / 单元测试用的内存容器便利方法。
@@ -50,7 +64,7 @@ enum ModelContainerFactory {
 
 // MARK: - 索引声明（iOS 18 起可用，架构 §3.4）
 //
-// 抬到 iOS 18 后，把下面两行移入 `SchemaV1`（`#Index` 只能写在 `@Model` 类型或其 extension 上），
+// 抬到 iOS 18 后，把下面两行移入 `SchemaV2`（`#Index` 只能写在 `@Model` 类型或其 extension 上），
 // 然后删掉这段注释即可，业务代码零改动：
 //
 //  extension LedgerEntry {

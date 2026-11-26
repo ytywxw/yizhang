@@ -249,6 +249,93 @@ struct CompletionConfirmation: Hashable, Sendable {
     var shouldCreateEntry: Bool { (amountCents ?? 0) > 0 }
 }
 
+// MARK: - 删除凭据
+
+/// 一条待办的**全字段**快照（V1.1 / F-TODO-11「删除此次及以后」的撤销凭据）。
+///
+/// 为什么不用 `Todo`（模型）而用值类型：
+/// ① 删除后模型已经不在库里，撤销要重建一个**全新**的 `Todo`，手里必须有一份脱离
+///    SwiftData identity map 的纯数据；
+/// ② 撤销的正确性标准是"逐字段一致"（收工标准 ⑫），值类型让这条断言可以写成
+///    `XCTAssertEqual(receipt.snapshot, TodoSnapshot(todo: restored))` 一句，
+///    而不是十几个散落的字段比较（漏一个就悄悄丢数据）。
+///
+/// 字段清单 = `Todo` 的全部标量 + 四个关系的 id。**加字段时同步两处**：
+/// 本结构体 + `restore(from:)`。
+struct TodoSnapshot: Hashable, Sendable {
+
+    let id: UUID
+    let title: String
+    let note: String
+    let dueDay: Int32
+    let dueTimeMinutes: Int32
+    let hasExpense: Bool
+    let hasEstimatedAmount: Bool
+    let estimatedAmount: Int64
+    let priorityRaw: String
+    let repeatRuleRaw: String
+    let repeatInterval: Int
+    let statusRaw: String
+    let completedAt: Date?
+    let reminderDay: Int32
+    let reminderMinutes: Int32
+    let linkedEntryID: UUID?
+    let createdAt: Date
+    let updatedAt: Date
+    // 关系（只存 id：撤销时重新解析，解析不到就留 nil）
+    let categoryID: UUID?
+    let accountID: UUID?
+    let sourceSubscriptionID: UUID?
+
+    init(todo: Todo) {
+        id = todo.id
+        title = todo.title
+        note = todo.note
+        dueDay = todo.dueDay
+        dueTimeMinutes = todo.dueTimeMinutes
+        hasExpense = todo.hasExpense
+        hasEstimatedAmount = todo.hasEstimatedAmount
+        estimatedAmount = todo.estimatedAmount
+        priorityRaw = todo.priorityRaw
+        repeatRuleRaw = todo.repeatRuleRaw
+        repeatInterval = todo.repeatInterval
+        statusRaw = todo.statusRaw
+        completedAt = todo.completedAt
+        reminderDay = todo.reminderDay
+        reminderMinutes = todo.reminderMinutes
+        linkedEntryID = todo.linkedEntryID
+        createdAt = todo.createdAt
+        updatedAt = todo.updatedAt
+        categoryID = todo.category?.id
+        accountID = todo.account?.id
+        sourceSubscriptionID = todo.sourceSubscription?.id
+    }
+
+    /// 这条待办是否属于一个重复系列（`repeatRule != .none`）。
+    var isRepeating: Bool { repeatRuleRaw != RepeatRule.none.raw }
+
+    /// 截止日（`0` = 无日期）。
+    var dueDate: DateOnly? {
+        dueDay > 0 ? DateOnly(key: dueDay) : nil
+    }
+}
+
+/// 一次「删除」的完整回执。
+///
+/// 三个字段各自回答撤销时的一个问题：
+/// - `snapshot`：怎么把这行原样放回去；
+/// - `spawnedNextID`：撤销时要不要先删掉删除动作**顺带生成**的那一期
+///   （漏了它，撤销「删除这一期」会留下两行 —— 收工标准 ⑬）；
+/// - `deletedAt`：Toast / 日志用，也用于「撤销只在 3 秒内有效」的口径说明。
+struct TodoDeletionReceipt: Hashable, Sendable {
+    let snapshot: TodoSnapshot
+    /// 这次删除是否**终止了一个重复系列**（`snapshot.isRepeating`）。
+    let stoppedSeries: Bool
+    /// 删除时顺便生成的下一期 id（「删除这一期」才会有；「删除此次及以后」恒为 nil）。
+    let spawnedNextID: UUID?
+    let deletedAt: Date
+}
+
 // MARK: - 服务
 
 /// 待办服务。
@@ -267,6 +354,12 @@ final class TodoService {
 
     /// 写入提交后的回调（由 `AppEnvironment` 接到 `bumpDataVersion()`）。
     var onDidCommit: (() -> Void)?
+
+    /// **软删之后**的清理钩子（V1.1；`reopen(keepEntry: false)` 是本类唯一的软删入口）。
+    ///
+    /// 语义与 `LedgerService.onDidSoftDelete` 一致：闭包单向出去，避免
+    /// `TodoService ↔ TrashService` 成环。
+    var onDidSoftDelete: (() -> Void)?
 
     init(writer: LedgerWriter, ledger: LedgerService, onDidCommit: (() -> Void)? = nil) {
         self.writer = writer
@@ -408,6 +501,135 @@ final class TodoService {
         onDidCommit?()
     }
 
+    // MARK: - 删除重复系列（V1.1 / F-TODO-11）
+
+    /// 删除「此次及以后」：删掉这一期，并且**不再生成下一期**。
+    ///
+    /// 语义等价于"这个重复到此为止"。已完成的历史记录（以及它们关联的账目）
+    /// **一条都不动**——那笔钱确实花出去了，删一条待办不该抹掉它（与 `delete(id:)` 同口径）。
+    ///
+    /// 原子性：本方法只做一件事（删一行），`writer.delete` 自带 `save()`，
+    /// 不存在"删了一半"的中间态。
+    ///
+    /// - Parameters:
+    ///   - id: 待办 id。
+    ///   - moment: 删除时刻（测试可注入）。
+    /// - Returns: 撤销凭据（`spawnedNextID` 恒为 nil）。
+    /// - Throws: `.todoNotFound`。
+    @discardableResult
+    func deleteAndStopSeries(id: UUID, at moment: Date = Date()) throws -> TodoDeletionReceipt {
+        guard let todo = try writer.todo(id: id) else { throw TodoError.todoNotFound }
+        let snapshot = TodoSnapshot(todo: todo)
+        try writer.delete(todo)
+        onDidCommit?()
+        return TodoDeletionReceipt(
+            snapshot: snapshot,
+            stoppedSeries: snapshot.isRepeating,
+            spawnedNextID: nil,
+            deletedAt: moment
+        )
+    }
+
+    /// 删除「这一期」：删掉这一期，但**系列继续** —— 顺带生成下一期（跳过这一次）。
+    ///
+    /// 与「删除此次及以后」的唯一区别就是这里 spawn 了一次。两者必须是**两个方法**：
+    /// 用一个 `stopSeries: Bool` 参数会让调用点长出 `delete(id:stopSeries: true)` 这种
+    /// 读不出意图的代码，而这两件事在 PRD 里是两个不同的按钮。
+    ///
+    /// 原子性（风险 R-TODO-9）：spawn 的插入与本次删除**共用同一次 `save()`**。
+    /// 若分成两次提交，App 在中间被杀就会得到"这一期没了、下一期也没生成"，
+    /// 用户的重复待办从此静默消失——这是最不该出现的一种数据丢失。
+    ///
+    /// - Parameters:
+    ///   - id: 待办 id。
+    ///   - moment: 删除时刻。
+    /// - Returns: 撤销凭据（`spawnedNextID` 为生成的那一期，可能是 nil）。
+    /// - Throws: `.todoNotFound`。
+    @discardableResult
+    func deleteCurrentOccurrence(id: UUID, at moment: Date = Date()) throws -> TodoDeletionReceipt {
+        guard let todo = try writer.todo(id: id) else { throw TodoError.todoNotFound }
+        let snapshot = TodoSnapshot(todo: todo)
+
+        // 只有**未完成**的重复待办才需要补下一期：
+        // 已完成的那条在 `complete` 时已经生成过下一期了，再 spawn 一次会凭空多出一行。
+        let spawnedNextID = todo.isOpen ? try spawnNextOccurrenceIfNeeded(todo) : nil
+
+        // save: false —— 与上面的插入落在同一次提交里
+        try writer.delete(todo, save: false)
+        try writer.save()
+        onDidCommit?()
+
+        return TodoDeletionReceipt(
+            snapshot: snapshot,
+            stoppedSeries: snapshot.isRepeating,
+            spawnedNextID: spawnedNextID,
+            deletedAt: moment
+        )
+    }
+
+    /// 撤销一次删除（3 秒 Toast 上的「撤销」）。
+    ///
+    /// 两件事必须做对：
+    /// ① **复用原 id**。`Todo.id` 没有 `.unique` 约束，技术上可以换新 UUID；但换掉之后
+    ///    账目的 `sourceRefID`（指向待办 id）会悬空、已排好的通知标识也对不上，
+    ///    用户看到的是"撤销回来了，但那笔账的「来源」不见了"。
+    /// ② **先清掉删除时 spawn 的那一期**，再把原行放回去。顺序反了（先插后删）也能得到
+    ///    同样的结果，但"先删"让中间态永远只有 0 或 1 行重复待办，不会短暂出现两行。
+    ///
+    /// 一次 `save()` 提交，中途被杀就整体不生效 —— 撤销失败比只撤销一半好。
+    ///
+    /// - Parameter receipt: `deleteAndStopSeries` / `deleteCurrentOccurrence` 的返回值。
+    /// - Throws: 写入失败。
+    func undoDeletion(_ receipt: TodoDeletionReceipt) throws {
+        // 已经存在同名 id（例如连点两次「撤销」）：什么都不做，避免主键冲突式的重复插入
+        if try writer.todo(id: receipt.snapshot.id) != nil { return }
+
+        if let spawnedNextID = receipt.spawnedNextID,
+           let spawned = try writer.todo(id: spawnedNextID) {
+            try writer.delete(spawned, save: false)
+        }
+
+        let todo = Todo()
+        try restore(todo, from: receipt.snapshot)
+        try writer.insert(todo, save: false)
+        try writer.save()
+        onDidCommit?()
+    }
+
+    /// 把快照写回一个新建的 `Todo`（撤销专用）。
+    ///
+    /// 关系现场解析：分类 / 账户 / 订阅 / 关联账目可能在这 3 秒里被别处删掉，
+    /// 解析不到就留 nil —— 让撤销成功、丢一个引用，好过让撤销整体失败。
+    private func restore(_ todo: Todo, from snapshot: TodoSnapshot) throws {
+        todo.id = snapshot.id
+        todo.title = snapshot.title
+        todo.note = snapshot.note
+        todo.dueDay = snapshot.dueDay
+        todo.dueTimeMinutes = snapshot.dueTimeMinutes
+        todo.hasExpense = snapshot.hasExpense
+        todo.hasEstimatedAmount = snapshot.hasEstimatedAmount
+        todo.estimatedAmount = snapshot.estimatedAmount
+        todo.priorityRaw = snapshot.priorityRaw
+        todo.repeatRuleRaw = snapshot.repeatRuleRaw
+        todo.repeatInterval = snapshot.repeatInterval
+        todo.statusRaw = snapshot.statusRaw
+        todo.completedAt = snapshot.completedAt
+        todo.reminderDay = snapshot.reminderDay
+        todo.reminderMinutes = snapshot.reminderMinutes
+        todo.linkedEntryID = snapshot.linkedEntryID
+        todo.createdAt = snapshot.createdAt
+        todo.updatedAt = snapshot.updatedAt
+
+        todo.category = try writer.category(id: snapshot.categoryID)
+        todo.account = try writer.account(id: snapshot.accountID)
+        if let subscriptionID = snapshot.sourceSubscriptionID {
+            todo.sourceSubscription = try writer.subscription(id: subscriptionID)
+        }
+        if let entryID = snapshot.linkedEntryID {
+            todo.linkedEntry = try writer.entry(id: entryID)
+        }
+    }
+
     // MARK: - 完成（第一步）
 
     /// 勾选完成：**立刻**置 done，带花销则返回待确认的请求对象。
@@ -425,7 +647,6 @@ final class TodoService {
 
         // 重复待办：完成即生成下一期（下一期是独立记录，删这一期不会牵连它）
         let spawned = try spawnNextOccurrenceIfNeeded(todo)
-
         try writer.save()
         onDidCommit?()
 
@@ -439,7 +660,7 @@ final class TodoService {
             completedAt: moment,
             hasExpense: todo.hasExpense,
             repeatRule: todo.repeatRule,
-            didSpawnNextOccurrence: spawned
+            didSpawnNextOccurrence: spawned != nil
         )
     }
 
@@ -511,6 +732,7 @@ final class TodoService {
         guard todo.isDone else { throw TodoError.notCompleted }
 
         let linkedID = todo.linkedEntryID
+        var didSoftDeleteEntry = false
         todo.status = .open
         todo.completedAt = nil
         todo.updatedAt = Date()
@@ -522,22 +744,33 @@ final class TodoService {
             // 软删（R-EDIT-3 的同一套语义）：账目仍可被恢复
             try writer.softDelete(id: linkedID, at: Date())
             todo.linkedEntryID = nil
+            didSoftDeleteEntry = true
         }
 
         try writer.save()
         onDidCommit?()
+        // 只有真的软删了账目才清理回收站：`keepEntry == true` 时本方法没往回收站里放东西，
+        // 跑一次全表清理纯属浪费（这条路径在"撤销完成"里很常见）。
+        if didSoftDeleteEntry {
+            onDidSoftDelete?()
+        }
     }
 
     // MARK: - 重复实例
 
     /// 生成下一期重复实例。
     ///
-    /// - Returns: 是否真的生成了（无重复规则 / 无截止日时返回 false）。
+    /// 返回 **id 而不是 Bool**：V1.1 的「删除这一期」需要把这个 id 塞进
+    /// `TodoDeletionReceipt.spawnedNextID`，撤销时才能精确地把它删掉（收工标准 ⑬）。
+    /// 用 Bool 的话调用方只能自己再查一次库猜哪一行是刚生成的。
+    ///
+    /// - Returns: 新生成的那一期 id；**没生成时返回 nil**（无重复规则 / 无截止日 /
+    ///   算出来的下一期不比当前晚）。
     @discardableResult
-    private func spawnNextOccurrenceIfNeeded(_ todo: Todo) throws -> Bool {
+    private func spawnNextOccurrenceIfNeeded(_ todo: Todo) throws -> UUID? {
         guard todo.repeatRule != .none,
               let unit = todo.repeatRule.cycleUnit,
-              let dueDate = todo.dueDate else { return false }
+              let dueDate = todo.dueDate else { return nil }
 
         let interval = max(todo.repeatInterval, 1)
         let nextDue = CycleAdvancer.advance(
@@ -546,7 +779,7 @@ final class TodoService {
             value: interval,
             anchorDay: dueDate.day
         )
-        guard nextDue.key > dueDate.key else { return false }
+        guard nextDue.key > dueDate.key else { return nil }
 
         let next = Todo()
         next.title = todo.title
@@ -581,7 +814,7 @@ final class TodoService {
         next.updatedAt = Date()
 
         try writer.insert(next, save: false)
-        return true
+        return next.id
     }
 
     // MARK: - 校验

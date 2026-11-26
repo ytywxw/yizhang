@@ -74,6 +74,83 @@ enum EntrySource: String, CaseIterable, Codable, Sendable {
     var needsBadge: Bool { self != .manual }
 }
 
+// MARK: - 账目确认状态
+
+/// 账目确认状态（V1.1 F-SUB-13）。
+///
+/// 只有订阅自动生成的**近期**账目才会是 `pending`（见 PRD 2.2 的生成规则），
+/// 手动记账与待办完成一律 `confirmed`——待办完成的那次确认本身就是一次人工确认。
+///
+/// 为什么是 `String` raw 而不是 `Bool`：留出"未来可能的第三态"的空间（如 `ignored`），
+/// 且与全项目"枚举一律落 `xxxRaw: String`"的约定一致（iOS 17 的 `#Predicate` 对枚举不稳）。
+///
+/// **计入口径**：`pending` 计入余额与一切统计（PRD 2.3-1）。它只是一个"我还没核对"的标记，
+/// 不是"这笔钱不存在"。
+enum EntryConfirmation: String, CaseIterable, Codable, Sendable {
+    case confirmed
+    case pending
+
+    /// 落库用的字符串值。
+    var raw: String { rawValue }
+
+    init?(raw: String) {
+        self.init(rawValue: raw)
+    }
+
+    var displayName: String {
+        switch self {
+        case .confirmed: return "已确认"
+        case .pending: return "待确认"
+        }
+    }
+
+    var isPending: Bool { self == .pending }
+}
+
+// MARK: - 「待确认」的判定规则（V1.1 F-SUB-13）
+
+/// 订阅账目「要不要等用户核对」的**唯一**判定实现。
+///
+/// 为什么规则放在 Domain 的枚举扩展里，而不是放进 `LedgerWriter` 或某个 Service：
+/// ① `LedgerWriter` **禁止包含业务规则**（架构 A3），它只负责"安全地落库"；
+/// ② 这条规则有**两条写入路径**——结算扫描（`SweepCoordinator`）与补录
+///    （`SubscriptionService.backfill` → `LedgerService.validated`）。若规则写两份，
+///    两条路径迟早分叉：一条给 pending、另一条给 confirmed，用户看到的徽标就会
+///    随"这笔账是怎么来的"而随机变化，而这种分叉单测很难发现。
+/// 所以：**规则只写一处，两处调用**（`SweepAction.confirmRaw` 与 `LedgerService.validated`）。
+///
+/// 窗口语义（PRD 2.2）：应扣日 `>= 今天 - 7 天` 即为待确认，也就是"今天与往前 7 天"
+/// （含首尾共 8 个自然日）。边界断言：今天 → pending；`-7` 天 → pending；
+/// `-8` 天 → confirmed（见 `EntryConfirmationTests`）。
+/// 之所以取 7 天这个量级：用户一般会在一周内核对一次账单；再久远的账目如果还是
+/// 待确认状态，等于把"提醒"变成"噪音"，用户只会学会无视那个徽标。
+extension EntryConfirmation {
+
+    /// 「待确认」窗口：应扣日距今不超过这么多天（含今天）。
+    static let pendingWindowDays = 7
+
+    /// 订阅在**某一期**上应该处于什么确认状态。
+    ///
+    /// - Parameters:
+    ///   - occurredDay: 该期的应扣日 `yyyyMMdd`（**不是今天**，见 R-SUB-4①）。
+    ///   - today: 设备本地时区的今天。**必须由调用方注入**（架构 R7）：冷启动补漏时
+    ///     会一次性生成几十天前的历史账目，如果拿"写入时刻"当基准，那些历史账目
+    ///     会被全部标成 pending，用户一打开 App 就看到几十笔待确认。
+    /// - Returns: 应扣日在窗口内 → `.pending`；更早 → `.confirmed`。
+    ///
+    /// 两个 `guard` 都是必要的：
+    /// - `occurredDay > 0`：`0` 是"没有日期"的哨兵值，不能拿它跟窗口比较；
+    /// - `today.key > 0`：`DateOnly.zero` 表示"今天未知"。此时窗口下界会退化成 `0`，
+    ///   于是任何账目都会被判成 pending——宁可退回 `confirmed`（用户不用去核对），
+    ///   也不能凭一个不存在的日期给全库账目打标。
+    static func forSubscription(occurredDay: Int32, today: DateOnly) -> EntryConfirmation {
+        guard occurredDay > 0 else { return .confirmed }
+        guard today.key > 0 else { return .confirmed }
+        let windowStart = today.adding(days: -pendingWindowDays).key
+        return occurredDay >= windowStart ? .pending : .confirmed
+    }
+}
+
 // MARK: - 账户类型
 
 /// 账户类型（PRD 3.2.2）。V1.0 预置 5 个账户。

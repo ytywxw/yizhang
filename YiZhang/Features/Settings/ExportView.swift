@@ -125,10 +125,13 @@ struct ExportView: View {
             }
 
             Section {
-                Text("CSV 列：日期、类型、金额、分类、账户、收款账户、备注、来源、已删除、创建时间。金额单位是元，两位小数；含逗号、引号、换行的字段会用双引号包起来（Excel 能直接认）。")
+                Text("CSV 列：日期、类型、金额、分类、账户、收款账户、备注、来源、确认状态、已删除、创建时间。其中「已删除」只在打开上面的开关时出现。金额单位是元，两位小数；含逗号、引号、换行的字段会用双引号包起来（Excel 能直接认）。")
                     .font(Theme.Typography.caption)
                     .foregroundStyle(.secondary)
-                Text("JSON 里金额是整数分（amountCents），避免浮点误差。")
+                Text("「确认状态」是 pending / confirmed：pending 表示这笔订阅账目还没核对过。")
+                    .font(Theme.Typography.caption)
+                    .foregroundStyle(.secondary)
+                Text("JSON 里金额是整数分（amountCents），避免浮点误差；每笔都带 confirmation 字段（pending / confirmed）。")
                     .font(Theme.Typography.caption)
                     .foregroundStyle(.secondary)
             } header: {
@@ -161,7 +164,12 @@ struct ExportView: View {
             fileURL = try await ExportService.makeFileInBackground(
                 rows: payload,
                 format: format,
-                includesDeletedColumn: includesDeleted
+                includesDeletedColumn: includesDeleted,
+                // 导出页恒带「确认状态」列（V1.1 F-SUB-13）：用户拿到的文件里
+                // 分不清哪几笔是"AI 猜的还没确认"，就会把待确认的金额当成既定事实。
+                // 注意这只影响本页；`ExportService.csv` 的默认值仍是 `false`，
+                // 默认表头因此逐字等于 `csvHeaderColumns`（已发布契约）。
+                includesConfirmationColumn: true
             )
             errorMessage = nil
         } catch {

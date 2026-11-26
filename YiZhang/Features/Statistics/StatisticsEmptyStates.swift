@@ -90,6 +90,20 @@ enum StatisticsEmptyCopy {
         "这个月还没有\(metric.displayName)记录，\(metric.displayName)趋势会显示在这里。"
     }
 
+    /// 同比环比（V1.1 F-ACC-16）：当期与两个基线都没有金额。
+    ///
+    /// 措辞刻意不说"没有数据"：用户可能刚记了账但从没记过上月/去年的，
+    /// 那种情况下卡片不会空（会显示「新增」+「去年同月无数据」），所以走到这条文案
+    /// 就只有一种可能——这个范围真的什么都没有。
+    static func comparison(rangeTitle: String, metric: StatisticsMetric) -> String {
+        "\(rangeTitle)还没有\(metric.displayName)记录，\(metric.displayName)同比环比会显示在这里。"
+    }
+
+    /// 账户构成：这个范围没有该口径的记录（或者记录全都没有账户、也没有金额）。
+    static func accountShares(rangeTitle: String, metric: StatisticsMetric) -> String {
+        "\(rangeTitle)还没有\(metric.displayName)记录，\(metric.displayName)按账户的分布会显示在这里。"
+    }
+
     /// 空态标题（页面级，当月完全没有数据时）。
     static func pageTitle(rangeTitle: String) -> String {
         "\(rangeTitle)还没有记录"

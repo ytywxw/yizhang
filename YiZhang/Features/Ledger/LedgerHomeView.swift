@@ -30,6 +30,15 @@ struct LedgerHomeView: View {
     @State private var highlightedEntryID: UUID?
     @State private var showsFilterSheet = false
     @State private var detailEntryID: UUID?
+    /// 待确认核对页（V1.1 F-SUB-13）。
+    @State private var showsPendingReview = false
+
+    /// 顶部「N 笔待确认」行动条被忽略的那一天（`yyyyMMdd`）。
+    ///
+    /// 存日期而不是 `Bool`：用户今天点了 `×`，明天新扣的那笔仍然要提示
+    /// （存 `Bool` 等于把提醒永久关掉，而这恰恰是用户最需要它的时候）。
+    /// **不进 schema**：这是纯界面偏好，不参与同步 / 导出 / 回收站。
+    @AppStorage("ledger.pendingBarDismissedDay") private var pendingBarDismissedDay: Int = 0
 
     var body: some View {
         // `ScrollViewReader` 本身是零成本容器，Release 里不会带来任何额外开销；
@@ -47,10 +56,17 @@ struct LedgerHomeView: View {
                     errorRow(message: errorMessage)
                 }
 
+                if showsPendingBar {
+                    pendingBar
+                }
+
                 MonthOverviewCard(
                     summary: viewModel.overview,
                     comparison: viewModel.comparison,
                     monthTitle: viewModel.monthTitle,
+                    pendingCount: viewModel.glance.pendingCount,
+                    pendingAmount: viewModel.glance.pendingAmount,
+                    onTapPending: { showPendingOnly() },
                     onTap: { statisticsTarget = true }
                 )
                 .padding(.horizontal, Theme.Spacing.md)
@@ -135,6 +151,11 @@ struct LedgerHomeView: View {
             ) { newFilter in
                 viewModel.applyFilter(newFilter)
             }
+        }
+        .sheet(isPresented: $showsPendingReview) {
+            PendingReviewView()
+                .environment(environment)
+                .modelContainer(environment.container)
         }
         .toast(item: $toast)
         .accessibilityIdentifier("ledger.home")
@@ -247,6 +268,85 @@ struct LedgerHomeView: View {
             )
             .padding(.horizontal, Theme.Spacing.md)
         }
+    }
+
+    // MARK: - 待确认行动条（V1.1 F-SUB-13）
+
+    /// 是否显示行动条：有东西要核对，且今天还没点过 `×`。
+    private var showsPendingBar: Bool {
+        viewModel.glance.pendingCount > 0
+            && pendingBarDismissedDay != Int(viewModel.today.key)
+    }
+
+    /// 顶部行动条：「3 笔待确认 · 一次性确认 ›」+ `×`。
+    ///
+    /// 为什么是行动条而不是弹窗/角标：待确认的正确处理时机是"用户自己想起来核对"，
+    /// 不是"开机就被拦住"。行动条不打断任何流程，看完账本顺手就能点掉；
+    /// 而 `×` 让"我今天不想处理"有一个体面的出口（否则用户只能忍着这块黄条）。
+    private var pendingBar: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            Button {
+                showsPendingReview = true
+            } label: {
+                HStack(spacing: Theme.Spacing.xxs) {
+                    Image(systemName: "clock.badge.questionmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .accessibilityHidden(true)
+
+                    Text("\(viewModel.glance.pendingCount) 笔待确认 · 一次性确认")
+                        .font(Theme.Typography.captionStrong)
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .accessibilityHidden(true)
+
+                    Spacer(minLength: 0)
+                }
+                .foregroundStyle(Theme.Semantic.pending)
+                .padding(.horizontal, Theme.Spacing.sm)
+                .frame(height: 36)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(Theme.Semantic.pending.opacity(0.14))
+                )
+                .contentShape(Capsule(style: .continuous))
+            }
+            .buttonStyle(.plain)
+            .frame(minHeight: Theme.minimumTapSize)
+            .accessibilityLabel(
+                Text("\(viewModel.glance.pendingCount) 笔待确认，轻点一次性确认")
+            )
+            .accessibilityIdentifier("ledger.pendingBar")
+
+            Button {
+                // 只忽略"今天"：明天新生成的待确认还要提示
+                pendingBarDismissedDay = Int(viewModel.today.key)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 32, height: 32)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .frame(minHeight: Theme.minimumTapSize)
+            .accessibilityLabel(Text("今天不再提示待确认"))
+            .accessibilityIdentifier("ledger.pendingBar.dismiss")
+        }
+        .padding(.horizontal, Theme.Spacing.md)
+    }
+
+    /// 把列表切到"只看待确认"。
+    ///
+    /// 保留用户当前的其它条件（时间 / 分类 / 账户…）再加一维，而不是清空重来：
+    /// 用户可能是先筛了"餐饮"才想起要核对的，清掉他的筛选等于替他把问题改了。
+    private func showPendingOnly() {
+        var filter = viewModel.filter
+        filter.pendingOnly = true
+        viewModel.applyFilter(filter)
     }
 
     // MARK: - 筛选 chips

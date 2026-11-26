@@ -17,6 +17,10 @@
 //  ④ **已完成默认折叠**：列表的主语是"还没做的事"，已完成只提供"我刚才是不是勾错了"的核对入口。
 //  ⑤ **下拽/取消关闭完成条必须回滚完成状态**：`complete()` 会先把状态置 done 再返回请求，
 //     所以"用户改主意了"这条路径必须显式 `reopen`（见 `TodoCompletionSheetViewModel`）。
+//  ⑥ **删除重复待办分两种语义，撤销靠"快照 + 原 id"而不是"再建一条新的"**（V1.1 / F-TODO-11）：
+//     「删除这一期」= 跳过这一次（生成下一期），「删除此次及以后」= 系列到此为止。
+//     两者的撤销都走 `TodoService.undoDeletion(_:)`，凭据里存着删之前的**全字段快照**，
+//     撤回来的是同一条记录（同 id），账目的 `sourceRefID`、已排通知都对得上。
 //
 
 import Foundation
@@ -70,6 +74,14 @@ struct TodoRowModel: Identifiable, Hashable, Sendable {
     let hasLinkedEntry: Bool
     /// 关联账目是否已被软删（D22：保留关联，渲染时判断）。
     let linkedEntryDeleted: Bool
+    /// 这条待办是否属于一个重复系列（V1.1 / F-TODO-11）。
+    ///
+    /// **必须是 `var` 且带默认值**：写成 `let` 带默认值会被剔出 memberwise init，
+    /// 于是所有既有调用点（含测试与 Preview）都会因为多出一个必填参数而编译失败；
+    /// 放在声明区末尾 + `var` 才能让它成为"可选的新增参数"。
+    ///
+    /// 菜单据此决定出三项还是两项（见 `TodoRowView.menu`）。
+    var isRepeating: Bool = false
 
     /// 副行整串。
     var subtitle: String {
@@ -88,6 +100,19 @@ struct TodoGroupModel: Identifiable, Hashable, Sendable {
     var count: Int { rows.count }
     /// 分组头右侧的数字（「已完成」显示总数，其余显示条数）。
     var detailText: String { "\(count)" }
+}
+
+// MARK: - 删除反馈
+
+/// 一次删除动作的反馈（UI 用它决定 Toast 文案与要不要挂「撤销」）。
+///
+/// 为什么不让 ViewModel 直接返回 `TodoDeletionReceipt`：凭据里含全字段快照，
+/// View 拿到它只会误用（比如自己再拼一次撤销调用，绕过 3 秒窗口）。
+/// View 需要的只有两件事：说什么、能不能撤销。
+struct TodoDeletionFeedback: Hashable, Sendable {
+
+    let message: String
+    let canUndo: Bool
 }
 
 // MARK: - ViewModel
@@ -185,11 +210,13 @@ final class TodoListViewModel {
         SubscriptionOverview.upcomingTotal(dueItems)
     }
 
-    /// 展示用分组（已完成按折叠状态过滤）。
+    /// 展示用分组。**「已完成」永远不在这里。**
+    ///
+    /// 它由 `TodoListView.completedToggleBlock` 单独渲染（折叠头 + 展开后的行），
+    /// 这一层再放一次就会让每条已完成记录被画两遍（V1.0 的既有缺陷）。
+    /// 折叠状态只影响那张折叠头展不展开，不影响这里。
     var visibleGroups: [TodoGroupModel] {
-        groups.filter { group in
-            !(group.kind == .done && isCompletedCollapsed)
-        }
+        groups.filter { $0.kind != .done }
     }
 
     /// 已完成是否有内容（决定要不要画那张折叠头）。
@@ -250,6 +277,8 @@ final class TodoListViewModel {
     }
 
     /// 删未完成待办（D23：真删，不做软删）。
+    ///
+    /// 这是**非重复**待办与「已完成」行的唯一删除入口（V1.0 行为，不挂撤销）。
     @discardableResult
     func delete(id: UUID) -> String? {
         guard let environment else { return nil }
@@ -261,6 +290,160 @@ final class TodoListViewModel {
             errorMessage = "删除没成功：\(error.localizedDescription)。下拉刷新后重试。"
             return nil
         }
+    }
+
+    // MARK: - 重复系列：删除 + 3 秒撤销（V1.1 / F-TODO-11）
+
+    /// 撤销窗口时长（秒），与 Toast 的自动消失时长一致。
+    ///
+    /// 两处时长**必须同源**：Toast 先消失、窗口还在，用户会找不到撤销入口；
+    /// 窗口先过期、Toast 还在，用户点了也没反应。所以这里用常量而不是各写一个 3。
+    static let undoWindow: TimeInterval = 3
+
+    /// 最近一次删除的撤销凭据（`nil` = 当前没有可撤销的删除）。
+    private(set) var undoReceipt: TodoDeletionReceipt?
+
+    /// 撤销入口的截止时刻。到点后即便 `undoReceipt` 还没来得及清，也必须拒绝撤销
+    /// （`undoDeletion` 里会再校验一次 `Date() < undoExpiresAt`）。
+    private(set) var undoExpiresAt: Date?
+
+    /// 过期计时器。**连续两次删除必须先 cancel 旧的**，否则第一次的计时器到点会把
+    /// 第二次刚拿到的凭据一起清掉 —— 撤销按钮点了没反应，且没有任何报错。
+    private var undoExpiryTask: Task<Void, Never>?
+
+    /// 当前是否还能撤销（UI 用它决定 Toast 上要不要挂「撤销」）。
+    var canUndoDeletion: Bool {
+        guard undoReceipt != nil, let expiresAt = undoExpiresAt else { return false }
+        return Date() < expiresAt
+    }
+
+    /// 「删除此次及以后」：删掉这一期，且不再生成下一期。
+    ///
+    /// - Returns: Toast 用的文案 + 是否可撤销；`nil` 表示失败（错误已进 `errorMessage`）。
+    @discardableResult
+    func deleteAndStopSeries(id: UUID) async -> TodoDeletionFeedback? {
+        guard let environment else { return nil }
+        do {
+            let receipt = try environment.todo.deleteAndStopSeries(id: id)
+            beginUndoWindow(receipt)
+            load()
+            // 删掉一条待办 = pending 里少一条提醒；不重算就会在到期日提醒一件
+            // 已经不存在的待办（收工标准 ⑪）
+            await environment.rescheduleNotifications(today: today)
+            return TodoDeletionFeedback(
+                message: receipt.stoppedSeries ? "已删除，以后不会再重复" : "已删除待办",
+                canUndo: true
+            )
+        } catch {
+            errorMessage = "删除没成功：\(error.localizedDescription)。下拉刷新后重试。"
+            return nil
+        }
+    }
+
+    /// 「删除这一期」：跳过这一次，系列继续（内部会生成下一期）。
+    @discardableResult
+    func deleteCurrentOccurrence(id: UUID) async -> TodoDeletionFeedback? {
+        guard let environment else { return nil }
+        do {
+            let receipt = try environment.todo.deleteCurrentOccurrence(id: id)
+            beginUndoWindow(receipt)
+            load()
+            // 这一次没了、下一期来了：pending 必须整体换成新的那一期
+            await environment.rescheduleNotifications(today: today)
+            return TodoDeletionFeedback(message: "已跳过这一期", canUndo: true)
+        } catch {
+            errorMessage = "删除没成功：\(error.localizedDescription)。下拉刷新后重试。"
+            return nil
+        }
+    }
+
+    /// 把**外部**（详情页编辑器）产生的一次删除接进本页的撤销窗口。
+    ///
+    /// 为什么必须回传凭据、而不是让详情页自己弹一个带「撤销」的 Toast：
+    /// 撤销窗口由本类的 `undoExpiryTask` **独占**（时长常量 `undoWindow` 也只有一个）。
+    /// 详情页删完就 `dismiss()` 了，它没有位置挂这个窗口；在那边再开一个，
+    /// 屏幕上就有两条独立的 3 秒计时器 —— 一条过期会把另一条的凭据一起清掉，
+    /// 用户点了「撤销」没反应且没有任何报错。所以凭据必须回到这里。
+    ///
+    /// 内部**复用** `beginUndoWindow`（它会先 `cancel` 掉上一个计时器），
+    /// 不复制第二份 3 秒逻辑。
+    ///
+    /// - Parameters:
+    ///   - receipt: 编辑器删成功后交回来的凭据。
+    ///   - message: 编辑器已经决定好的 Toast 文案（「已停止重复」等）。
+    /// - Returns: Toast 用的文案 + 是否可撤销。
+    @discardableResult
+    func adoptUndo(_ receipt: TodoDeletionReceipt, message: String) -> TodoDeletionFeedback {
+        beginUndoWindow(receipt)
+        load()
+        // 删掉一条待办 = pending 里少一条提醒（收工标准 ⑪），必须重算，
+        // 否则到期日会为一条已经不存在的待办发通知。
+        //
+        // 这里**不能** `await`：调用点是 sheet 的同步关闭闭包，而撤销窗口的注册
+        // 必须先于 `dismiss()` 完成 —— 晚一拍注册，Toast 上的「撤销」会有一瞬
+        // 点了没反应（`canUndoDeletion` 还是 false）。所以重算作为独立任务派出去。
+        if let environment {
+            let today = today
+            Task { await environment.rescheduleNotifications(today: today) }
+        }
+        return TodoDeletionFeedback(message: message, canUndo: true)
+    }
+
+    /// 撤销上一次删除（3 秒内有效）。
+    ///
+    /// - Returns: Toast 文案；`nil` 表示已过期或失败。
+    @discardableResult
+    func undoDeletion(now: Date = Date()) async -> String? {
+        guard let environment else { return nil }
+        guard let receipt = undoReceipt, let expiresAt = undoExpiresAt else { return nil }
+
+        // 二次校验：计时器和点击之间存在竞态（计时器可能还没被调度到）
+        guard now < expiresAt else {
+            clearUndoWindow()
+            return nil
+        }
+
+        do {
+            // `TodoService.undoDeletion` 内部对"原 id 已存在"直接返回，
+            // 所以连点两次「撤销」不会插出第二条
+            try environment.todo.undoDeletion(receipt)
+        } catch {
+            // 写失败时**不关窗口**：凭据还在，用户还能再点一次（窗口未必已过期）。
+            // 这里绝不先 clear 再 try —— 那样一次瞬时失败就永久丢掉撤销机会。
+            errorMessage = "撤销没成功：\(error.localizedDescription)。下拉刷新可以看到最新状态。"
+            return nil
+        }
+
+        clearUndoWindow()
+        load()
+        await environment.rescheduleNotifications(today: today)
+        return receipt.stoppedSeries ? "已撤销，重复设置也回来了" : "已撤销删除"
+    }
+
+    /// 打开撤销窗口（并重启计时器）。
+    private func beginUndoWindow(_ receipt: TodoDeletionReceipt, now: Date = Date()) {
+        undoExpiryTask?.cancel()
+        undoReceipt = receipt
+        let expiresAt = now.addingTimeInterval(TodoListViewModel.undoWindow)
+        undoExpiresAt = expiresAt
+        // 弱引用：ViewModel 被释放后计时器不再持有它，也不需要谁去 cancel
+        undoExpiryTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(TodoListViewModel.undoWindow))
+            guard !Task.isCancelled else { return }
+            guard let self else { return }
+            // 到点才清。**不比对 receipt 的 id**：`beginUndoWindow` 已经 cancel 了旧计时器，
+            // 能走到这里的只可能是"当前这一次"的计时器。
+            if let current = self.undoExpiresAt, Date() >= current {
+                self.clearUndoWindow()
+            }
+        }
+    }
+
+    private func clearUndoWindow() {
+        undoExpiryTask?.cancel()
+        undoExpiryTask = nil
+        undoReceipt = nil
+        undoExpiresAt = nil
     }
 
     /// 「移到明天」。
@@ -392,7 +575,8 @@ final class TodoListViewModel {
             priority: todo.priority,
             isFromSubscription: todo.sourceSubscription != nil,
             hasLinkedEntry: todo.hasLinkedEntry,
-            linkedEntryDeleted: deletedEntry
+            linkedEntryDeleted: deletedEntry,
+            isRepeating: todo.repeatRule != .none
         )
     }
 

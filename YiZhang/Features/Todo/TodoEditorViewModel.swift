@@ -22,8 +22,14 @@ import SwiftData
 
 // MARK: - 保存结果
 
-/// 保存成功后的结果。
-struct TodoEditorResult: Hashable, Sendable {
+/// `save()` 成功后的结果。
+///
+/// 只描述「写进库里的那一条」，不含文案 —— 文案是 View 的事（「已添加待办」/「已保存」
+/// 取决于 `isNew`，而 `isNew` 只有这里知道）。
+///
+/// ⚠️ 别把它和 `TodoEditorResult` 搞混：那个是**关闭编辑器时交给调用方的信封**
+/// （`.saved` / `.deleted`），这个只是保存这一步的返回值。
+struct TodoSaveOutcome: Hashable, Sendable {
     let todoID: UUID
     let isNew: Bool
 }
@@ -99,6 +105,12 @@ final class TodoEditorViewModel {
 
     /// 详情态：这条待办是否已完成。
     private(set) var isDone = false
+
+    /// 这条待办是否属于一个重复系列。
+    ///
+    /// 只看 `repeatRule`：`repeatInterval` 是「每 N 次」的**修饰**，不是"是否重复"的判据——
+    /// 一条 `.none` + `interval 3` 的待办不重复，而一条 `.daily` + `interval 3` 仍然重复。
+    var isRepeating: Bool { repeatRule != .none }
     /// 详情态：关联账目 id（可能指向已软删的账目，D22）。
     private(set) var linkedEntryID: UUID?
     /// 详情态：关联账目是否已被软删。
@@ -332,7 +344,7 @@ final class TodoEditorViewModel {
     ///
     /// - Returns: 成功时的结果；失败返回 nil 并写入 `errorMessage`。
     @discardableResult
-    func save() -> TodoEditorResult? {
+    func save() -> TodoSaveOutcome? {
         errorMessage = nil
         guard let environment else {
             errorMessage = "数据还没准备好，请稍后再试"
@@ -371,7 +383,7 @@ final class TodoEditorViewModel {
                     reminderMinutes: reminderTime
                 )
                 let id = try environment.todo.create(draft)
-                return TodoEditorResult(todoID: id, isNew: true)
+                return TodoSaveOutcome(todoID: id, isNew: true)
 
             case .edit(let id):
                 var changes = TodoChanges()
@@ -393,7 +405,7 @@ final class TodoEditorViewModel {
                 changes.reminderMinutes = reminderTime
 
                 try environment.todo.update(id: id, changing: changes)
-                return TodoEditorResult(todoID: id, isNew: false)
+                return TodoSaveOutcome(todoID: id, isNew: false)
             }
         } catch let error as TodoError {
             errorMessage = error.errorDescription
@@ -425,17 +437,61 @@ final class TodoEditorViewModel {
         }
     }
 
-    /// 删除待办（硬删；关联账目保留）。
+    // MARK: - 删除
+
+    /// 「删除此次及以后」：删掉这一条，并且不再生成下一期。
+    ///
+    /// **非重复待办也走这个方法**（服务层对非重复就是硬删、不 spawn，
+    /// `receipt.stoppedSeries == false`）—— 详情页不再保留一条"裸删"捷径。
+    /// 两条通路做的是同一件事，早晚只会有人改其中一条，留着就是埋雷。
+    ///
+    /// 走 `environment.todo.deleteAndStopSeries(id:)`，**本方法不自己拼凭据**：
+    /// 凭据里的 `snapshot` 必须由服务层在删除前拍下，这里再拍一次就会漏掉
+    /// 服务层在删除过程中改动的字段。
+    ///
+    /// - Returns: `.deleted` + 撤销凭据；失败返回 nil 并写入 `errorMessage`。
     @discardableResult
-    func delete() -> String? {
+    func deleteAndStopSeries() -> TodoEditorResult? {
         guard let environment, let id = mode.todoID else { return nil }
         do {
-            try environment.todo.delete(id: id)
-            return "已删除待办"
+            let receipt = try environment.todo.deleteAndStopSeries(id: id)
+            return .deleted(message: deletionMessage(for: receipt), receipt: receipt)
         } catch {
             errorMessage = "删除没成功：\(error.localizedDescription)。下拉刷新后重试。"
             return nil
         }
+    }
+
+    /// 「删除这一期」：删掉这一条，系列继续（服务层会顺带生成下一期）。
+    ///
+    /// - Returns: `.deleted` + 撤销凭据（`spawnedNextID` 指向新生成的那一期）；失败返回 nil。
+    @discardableResult
+    func deleteCurrentOccurrence() -> TodoEditorResult? {
+        guard let environment, let id = mode.todoID else { return nil }
+        do {
+            let receipt = try environment.todo.deleteCurrentOccurrence(id: id)
+            return .deleted(message: "已跳过这一期", receipt: receipt)
+        } catch {
+            errorMessage = "删除没成功：\(error.localizedDescription)。下拉刷新后重试。"
+            return nil
+        }
+    }
+
+    /// 删除成功的 Toast 文案。
+    ///
+    /// **必须先判 `isDone`、再判 `stoppedSeries`**，顺序不能反：一条**已完成**的重复待办
+    /// `stoppedSeries` 也是 `true`（它确实属于一个重复系列），但它的下一期在
+    /// `complete` 时就已经生成了 —— 删掉这条历史记录**并不会让系列停下来**。
+    /// 反过来先判 `stoppedSeries`，用户点了「删除这条记录」却收到「已停止重复」，
+    /// 而系列明明还在，这是最糟的一种"文案比事实更严重"。
+    ///
+    /// 已完成且**不重复**的仍说「已删除待办」：与列表页 `delete(id:)` 的文案同口径，
+    /// 这一例本来就没有歧义，不需要跟着弹层标题一起改。
+    private func deletionMessage(for receipt: TodoDeletionReceipt) -> String {
+        if isDone {
+            return isRepeating ? "已删除记录" : "已删除待办"
+        }
+        return receipt.stoppedSeries ? "已停止重复" : "已删除待办"
     }
 
     // MARK: - 工具

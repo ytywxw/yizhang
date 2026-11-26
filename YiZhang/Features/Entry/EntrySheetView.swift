@@ -28,6 +28,13 @@ struct EntrySheetView: View {
 
     @State private var viewModel: EntryViewModel
 
+    /// 「＋ 存为模板」（把当前表单存成模板）。
+    @State private var showsSaveAsTemplate = false
+    /// 长按 chip →「编辑」。
+    @State private var templateToEdit: TemplateOption?
+    /// 长按 chip →「删除」（先确认，删除是不可撤销的）。
+    @State private var pendingTemplateDelete: TemplateOption?
+
     /// 保存成功回调（首页用它插入高亮 + Toast）。
     var onSaved: (EntrySaveResult) -> Void
 
@@ -62,8 +69,25 @@ struct EntrySheetView: View {
                         .padding(.horizontal, Theme.Spacing.md)
                         .padding(.top, Theme.Spacing.xs)
 
+                        // 常用模板 chips（V1.1 F-ACC-14）在金额区**上方**：
+                        // 它的作用是"替你填好这一笔"，顺序上必须先于"输入金额"。
+                        // 没有模板时整行自己隐藏，不留空态占位。
+                        TemplateChipsRow(
+                            templates: viewModel.templates,
+                            canCreate: viewModel.canCreateTemplate,
+                            warning: viewModel.templateWarning,
+                            iconName: { viewModel.categoryOption(for: $0)?.iconName ?? "tag" },
+                            onSelect: { viewModel.applyTemplate($0) },
+                            onEdit: { templateToEdit = $0 },
+                            onDelete: { pendingTemplateDelete = $0 },
+                            onCreate: { showsSaveAsTemplate = true }
+                        )
+
                         AmountDisplayView(text: viewModel.amountText, tone: viewModel.amountTone)
                             .padding(.horizontal, Theme.Spacing.md)
+                            // 模板填过金额时亮 0.3s：否则只改分类的那种模板
+                            // 会让人以为"点了没反应"，然后手动再点一遍分类
+                            .templateFlash(viewModel.templateFlash.contains(.amount))
 
                         if viewModel.type.isTransfer {
                             TransferAccountPicker(
@@ -80,12 +104,14 @@ struct EntrySheetView: View {
                                 selectedCategoryID: viewModel.highlightedCategoryID,
                                 onSelect: { viewModel.select(categoryID: $0) }
                             )
+                            .templateFlash(viewModel.templateFlash.contains(.category))
 
                             AccountPickerRow(
                                 accounts: viewModel.accounts,
                                 selectedID: viewModel.accountID,
                                 onSelect: { viewModel.select(accountID: $0) }
                             )
+                            .templateFlash(viewModel.templateFlash.contains(.account))
                         }
 
                         // 备注在日期之前：备注每次都可能要填，而"改日期"绝大多数时候
@@ -131,6 +157,38 @@ struct EntrySheetView: View {
             }
             .task {
                 viewModel.attach(environment)
+            }
+            .sheet(isPresented: $showsSaveAsTemplate) {
+                SaveAsTemplateSheet(
+                    initialName: defaultTemplateName,
+                    summary: templateSummary
+                ) { name in
+                    try createTemplate(named: name)
+                }
+            }
+            .sheet(item: $templateToEdit) { template in
+                TemplateEditorSheet(
+                    title: "编辑模板",
+                    initialDraft: TemplateDraft(template: template)
+                ) { draft in
+                    try environment.template.update(id: template.id, changing: draft)
+                    viewModel.reloadTemplates()
+                }
+            }
+            .confirmationDialog(
+                "删除这个模板？",
+                isPresented: Binding(
+                    get: { pendingTemplateDelete != nil },
+                    set: { if !$0 { pendingTemplateDelete = nil } }
+                ),
+                presenting: pendingTemplateDelete
+            ) { template in
+                Button("删除", role: .destructive) {
+                    deleteTemplate(template)
+                }
+                Button("取消", role: .cancel) {}
+            } message: { template in
+                Text("「\(template.name)」会从记账页消失，已记的账目不受影响。")
             }
         }
         .presentationDetents([.large])
@@ -263,6 +321,64 @@ struct EntrySheetView: View {
         guard let result = viewModel.save() else { return }
         onSaved(result)
         dismiss()
+    }
+
+    // MARK: - 模板动作
+
+    /// 默认模板名：备注 → 备注为空则分类名（PRD 5.3-3）。
+    private var defaultTemplateName: String {
+        let trimmedNote = viewModel.note.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedNote.isEmpty { return trimmedNote }
+        if let category = viewModel.categoryOption(for: viewModel.effectiveCategoryID) {
+            return category.name
+        }
+        return viewModel.type.displayName
+    }
+
+    /// 弹窗里那句"会存下什么"。
+    private var templateSummary: String {
+        var parts: [String] = [viewModel.type.displayName]
+        if let amount = viewModel.amount, amount.cents > 0 {
+            parts.append(amount.conciseText)
+        } else {
+            parts.append("金额待填")
+        }
+        if let category = viewModel.categoryOption(for: viewModel.effectiveCategoryID) {
+            parts.append(category.name)
+        }
+        if let account = viewModel.accounts.first(where: { $0.id == viewModel.accountID }) {
+            parts.append(account.name)
+        }
+        let trimmedNote = viewModel.note.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedNote.isEmpty {
+            parts.append("备注「\(trimmedNote)」")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// 把表单当前内容存成模板（走 `TemplateService.create`，不经过账目）。
+    private func createTemplate(named name: String) throws {
+        let cents = viewModel.amount?.cents ?? 0
+        let draft = TemplateDraft(
+            name: name,
+            typeRaw: viewModel.type.raw,
+            amount: cents,
+            hasAmount: cents > 0,
+            note: viewModel.note.trimmingCharacters(in: .whitespacesAndNewlines),
+            categoryID: viewModel.effectiveCategoryID,
+            accountID: viewModel.accountID
+        )
+        try environment.template.create(draft)
+        viewModel.reloadTemplates()
+    }
+
+    private func deleteTemplate(_ template: TemplateOption) {
+        do {
+            try environment.template.delete(id: template.id)
+        } catch {
+            viewModel.showTemplateError(error)
+        }
+        viewModel.reloadTemplates()
     }
 }
 

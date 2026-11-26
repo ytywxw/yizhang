@@ -12,6 +12,10 @@
 //  - **来源是待办**：软删，且**绝不改待办的完成状态**——用户删的是"这笔支出"，
 //    不是"这件事没做过"。提示语要把这一点说清楚，否则用户会以为待办被撤销了。
 //
+//  V1.1 F-SUB-13 的「待确认」也落在本页：订阅账目在 7 天窗口内是 `pending`，
+//  顶部出现琥珀色徽标 + 「这是对的」/「不是这笔」两个按钮。否定走的是 A 分支同一条实现
+//  （`SubscriptionService.denyEntry`），不是另写一套。
+//
 //  为什么「撤销」要留在本页 3 秒而不是回列表弹 Toast：
 //  详情页是可能从筛选结果、跨月、甚至深链进来的，删完立刻 dismiss 会让 Toast 出现在
 //  一个用户没预期的位置（甚至回到一个已经不包含这笔账的列表）。在本页原地变成
@@ -40,6 +44,8 @@ struct EntryDetailModel: Hashable {
     let isSourceDeleted: Bool
     /// 来源名称（用于「来源已删除」时的可读文案）。
     let sourceDisplayName: String
+    /// 是否为「待确认」的订阅账目（V1.1 F-SUB-13）。
+    let isPending: Bool
 
     var day: DateOnly { snapshot.occurredDate }
     var note: String { snapshot.note }
@@ -53,6 +59,7 @@ struct EntryDetailModel: Hashable {
         accountName = entry.account?.displayName ?? "账户已删除"
         toAccountName = entry.toAccount?.displayName
         sourceDisplayName = entry.source.displayName
+        isPending = entry.isPending
 
         if entry.isTransfer {
             categoryName = "转账"
@@ -89,6 +96,28 @@ struct EntryDetailView: View {
     /// 要展示的账目 id。
     let entryID: UUID
 
+    /// 只读态（V1.1 回收站）：从「最近删除」进来看一条已软删的账目。
+    ///
+    /// 只读态必须藏掉所有**写入口**，否则用户会在一个"已经删掉的账目"上改数据：
+    /// - 工具栏的「编辑」「删除」（编辑一笔回收站里的账，改完它还是在回收站里，
+    ///   用户会以为保存失败）；
+    /// - 待确认的「这是对的 / 不是这笔」（`confirm` / `deny` 都是写操作，
+    ///   `deny` 还会往抑制表里写东西，而它本来就是被删掉的那一笔）；
+    /// - 「来自」区的跳转（源对象可能还活着，但从回收站跳进订阅编辑器
+    ///   会让人搞不清自己在编辑什么）。
+    ///
+    /// 底部换成「恢复」/「彻底删除」两个动作，见 `readOnlyBar`。
+    ///
+    /// 默认值 `false` 是必须的：本页在账本、筛选、深链等七八处被构造，
+    /// 没有默认值会让所有既有调用点一起编译失败。
+    var isReadOnly: Bool = false
+
+    /// 只读态动作完成后的回传。
+    ///
+    /// 为什么不自己弹 Toast：恢复成功后本页会立刻 `dismiss()`，
+    /// 一个随视图消失的 Toast 等于没提示。结果交给上一页（`TrashView`）去展示。
+    var onReadOnlyResult: ((String) -> Void)?
+
     @Environment(AppEnvironment.self) private var environment
     @Environment(\.dismiss) private var dismiss
 
@@ -99,10 +128,21 @@ struct EntryDetailView: View {
     /// B 分支的二次确认（硬删不可撤销，必须再问一次）。
     @State private var showsRevertConfirmation = false
     @State private var showsEditor = false
+    /// 只读态「彻底删除」的二次确认（不可恢复，必须再问一次）。
+    @State private var showsPurgeConfirmation = false
     /// 软删凭据：非 nil 时本页进入「已删除 + 撤销」状态。
     @State private var undoToken: UndoToken?
+    /// 这次删除是不是从「不是这笔」（待确认否定）发起的。
+    ///
+    /// 只影响「已删除」那屏的说明文案：从否定进来的用户没有见过三选项对话框，
+    /// 不该被告知"请选另一个选项"。
+    @State private var deniedAsPending = false
     /// 「来自」区点开后要展示的来源编辑器（订阅 / 待办）。
     @State private var sourceEditor: SourceEditorRoute?
+    /// 「⋯ → 存为模板…」（V1.1 F-ACC-14 / PRD 5.3-3）。
+    @State private var showsSaveAsTemplate = false
+    /// 存模板成功后的轻提示。
+    @State private var toast: ToastItem?
 
     var body: some View {
         Group {
@@ -118,10 +158,18 @@ struct EntryDetailView: View {
             }
         }
         .background(Theme.Semantic.pageBackground)
-        .navigationTitle("账目详情")
+        .navigationTitle(isReadOnly ? "已删除的账目" : "账目详情")
         .navigationBarTitleDisplayMode(.inline)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            // 只读态：底部换「彻底删除」/「恢复」（PRD §6.1）。
+            // 判据带上 `undoToken == nil` 是因为删除后的那一屏不该还留着恢复按钮
+            // （那时这笔账已经删了，再点「恢复」是自相矛盾的两个状态）。
+            if isReadOnly, model != nil, undoToken == nil {
+                readOnlyBar
+            }
+        }
         .toolbar {
-            if model != nil, undoToken == nil {
+            if model != nil, undoToken == nil, !isReadOnly {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("编辑") { showsEditor = true }
                         .accessibilityIdentifier("detail.edit")
@@ -136,7 +184,35 @@ struct EntryDetailView: View {
                     .accessibilityLabel(Text("删除这笔账"))
                     .accessibilityIdentifier("detail.delete")
                 }
+                // 「⋯」里目前只有「存为模板…」一项。用 Menu 而不是再加一个图标：
+                // 详情页已经有「编辑」+「删除」两个动作，第三个动作再占一个图标位，
+                // 右边会挤成一排小图标（iPhone SE 宽度实测会压到标题）。
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            showsSaveAsTemplate = true
+                        } label: {
+                            Label("存为模板…", systemImage: "square.grid.2x2")
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
+                    }
+                    .accessibilityLabel(Text("更多操作"))
+                    .accessibilityIdentifier("detail.more")
+                }
             }
+        }
+        .confirmationDialog(
+            "彻底删除这笔账？",
+            isPresented: $showsPurgeConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("彻底删除", role: .destructive) {
+                purgeFromTrash()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("彻底删除后无法恢复，这笔账会从数据库里移除。")
         }
         .confirmationDialog(
             "删除这笔账？",
@@ -174,6 +250,23 @@ struct EntryDetailView: View {
                 .modelContainer(environment.container)
             }
         }
+        .sheet(isPresented: $showsSaveAsTemplate) {
+            if let model {
+                // 走 `makeFrom`：这笔账的金额 / 备注 / 分类 / 账户原样搬进模板，
+                // `hasAmount` 跟随原账目（金额 > 0 则记住金额，PRD 5.3-3）。
+                SaveAsTemplateSheet(
+                    initialName: templateDefaultName(model),
+                    summary: templateSummary(model)
+                ) { name in
+                    let template = try environment.template.makeFrom(
+                        entryID: model.snapshot.id,
+                        name: name
+                    )
+                    toast = ToastItem(message: "已存为模板「\(template.displayName)」")
+                }
+            }
+        }
+        .toast(item: $toast)
         .sheet(item: $sourceEditor) { route in
             // 两个编辑器自己带 `NavigationStack` 并自己 `dismiss()`，
             // 所以这里只负责"保存/删除之后重读这笔账"——名称可能已经变了。
@@ -183,7 +276,25 @@ struct EntryDetailView: View {
                     load()
                 }
             case .todo(let id):
-                TodoEditorView(mode: .edit(id), today: DateOnly(Date())) { _ in
+                TodoEditorView(mode: .edit(id), today: DateOnly(Date())) { result in
+                    // 这里**故意不接撤销**（降级为只显示消息），理由不是"懒"：
+                    //
+                    // 本页的 `.toast(item:)` 组件本身支持动作按钮（`ToastItem.actionTitle`），
+                    // 技术上能挂一个「撤销」。缺的是**窗口的归属**：3 秒撤销窗口住在
+                    // `TodoListViewModel` 里（`undoExpiryTask` + `undoWindow` 都是一个实例私有的），
+                    // 而本页在账本 Tab，整个层级里没有那个实例。
+                    //
+                    // 在这里 new 一个 `TodoListViewModel` 只为拿撤销窗口，等于屏幕上出现
+                    // 第二个独立的 3 秒计时器：两个窗口各自过期、各自清凭据，谁也管不了谁。
+                    // 代价（两个计时器打架、用户点了没反应且无报错）远大于收益
+                    // （从账目详情里删关联待办本就是极低频路径）。
+                    //
+                    // 所以本页只把"删了什么"如实说出来 —— 删除本身已经生效，
+                    // 用户想知道系列有没有被停掉，看这条消息就够了。
+                    if case .deleted(let message, _) = result {
+                        toast = ToastItem(message: message)
+                    }
+                    // 待办被删 / 改名 / 改了关联，这笔账的「来自」区都可能变，所以要重读。
                     load()
                 }
             }
@@ -226,6 +337,16 @@ struct EntryDetailView: View {
     /// 头部：大金额 + 分类。
     private func amountCard(_ model: EntryDetailModel) -> some View {
         VStack(alignment: .leading, spacing: Theme.Spacing.xs) {
+            // 「待确认」徽标在卡片最顶部（V1.1 F-SUB-13）：
+            // 用户点进来的第一眼要能确认"这笔是要我核对的那笔"，
+            // 而不是先读到分类和金额、再往下翻找状态。
+            //
+            // 只读态下徽标**保留**：它描述的是这笔账的状态（恢复之后仍是待确认，
+            // PRD 6.3-5），不是动作。只藏掉下面对应的两个按钮。
+            if model.isPending {
+                pendingBadge
+            }
+
             HStack(spacing: Theme.Spacing.xs) {
                 CategoryGlyph(iconName: model.iconName, colorHex: model.colorHex, size: .medium)
 
@@ -258,6 +379,13 @@ struct EntryDetailView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            // 「这是对的 / 不是这笔」在只读态**必须隐藏**：两者都是写操作，
+            // 而 `deny` 还会往抑制表里写一笔——对一条已经在回收站里的账目做这件事，
+            // 语义上说不通（它本来就已经被"否定"掉了）。
+            if model.isPending, !isReadOnly {
+                pendingActions
+            }
         }
         .padding(Theme.Spacing.md)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -266,6 +394,58 @@ struct EntryDetailView: View {
                 .fill(Theme.Semantic.cardBackground)
         )
         .padding(.horizontal, Theme.Spacing.md)
+    }
+
+    private var pendingBadge: some View {
+        HStack(spacing: Theme.Spacing.xxs) {
+            Image(systemName: "clock.badge.questionmark")
+                .font(.system(size: 11, weight: .semibold))
+                .accessibilityHidden(true)
+
+            Text("待确认")
+                .font(Theme.Typography.captionStrong)
+        }
+        .foregroundStyle(Theme.Semantic.pending)
+        .padding(.horizontal, Theme.Spacing.xs)
+        .padding(.vertical, 2)
+        .background(
+            Theme.Semantic.pending.opacity(0.14),
+            in: Capsule(style: .continuous)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text("这笔账待确认"))
+    }
+
+    /// 「这是对的」/「不是这笔」。
+    ///
+    /// 两个动作的视觉权重是刻意的：确认（琥珀实心）是绝大多数情况，
+    /// 否定（红色描边）是少数情况却后果更重——所以它不用实心，避免顺手点掉。
+    private var pendingActions: some View {
+        HStack(spacing: Theme.Spacing.xs) {
+            Button {
+                deniedAsPending = true
+                deleteAndSuppress()
+            } label: {
+                Text("不是这笔")
+                    .font(Theme.Typography.captionStrong)
+                    .frame(maxWidth: .infinity, minHeight: Theme.minimumTapSize)
+            }
+            .buttonStyle(.bordered)
+            .tint(Theme.Semantic.danger)
+            .accessibilityIdentifier("detail.deny")
+
+            Button {
+                confirmPendingEntry()
+            } label: {
+                Text("这是对的")
+                    .font(Theme.Typography.captionStrong)
+                    .frame(maxWidth: .infinity, minHeight: Theme.minimumTapSize)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Theme.Semantic.pending)
+            .accessibilityIdentifier("detail.confirm")
+        }
+        .padding(.top, Theme.Spacing.xxs)
     }
 
     /// 明细：账户 / 日期 / 备注 / 创建时间。
@@ -326,9 +506,12 @@ struct EntryDetailView: View {
 
     /// 「来自」区的一行：源对象还在 → 可点进订阅 / 待办编辑器；源对象已删 → 纯文本。
     ///
-    /// 可点性的判据是**两个**：`sourceRefID` 存在（老数据可能缺）+ 源对象没被删。
-    /// 只判断前者会把「来源已删除」渲染成箭头，用户点进去是个空表单；
-    /// 只判断后者会在缺 `sourceRefID` 时给一个点了没反应的箭头。
+    /// 可点性的判据是**三个**：`sourceRefID` 存在（老数据可能缺）+ 源对象没被删
+    /// + 当前不是只读态。
+    /// 只判断第一个会把「来源已删除」渲染成箭头，用户点进去是个空表单；
+    /// 只判断第二个会在缺 `sourceRefID` 时给一个点了没反应的箭头；
+    /// 只判断前两个则会在回收站里给出一个通往订阅编辑器的入口——
+    /// 用户从一堆已删账目里点进"编辑订阅"，改完发现那笔账还在回收站，只会更困惑。
     @ViewBuilder
     private func sourceRow(_ model: EntryDetailModel) -> some View {
         let iconName = model.source == .subscription ? "arrow.triangle.2.circlepath" : "checklist"
@@ -353,7 +536,7 @@ struct EntryDetailView: View {
             }
             .frame(minHeight: Theme.minimumTapSize)
             .accessibilityIdentifier("detail.source.deleted")
-        } else if let referenceID = model.snapshot.sourceRefID {
+        } else if let referenceID = model.snapshot.sourceRefID, !isReadOnly {
             Button {
                 sourceEditor = model.source == .subscription
                     ? .subscription(referenceID)
@@ -463,6 +646,10 @@ struct EntryDetailView: View {
         case .manual:
             return "3 秒内可以撤销。"
         case .subscription:
+            if deniedAsPending {
+                // 从「不是这笔」进来的用户没见过三选项对话框，不能让他去"选另一个选项"
+                return "这一期不会再自动补回来，下次扣费日保持不变。3 秒内可以撤销。"
+            }
             return "这一期不会再自动补回来，下次扣费日保持不变。想让它重新生成，请选「删这笔账，并让订阅重新生成」。"
         case .todo:
             let title = model.sourceTitle ?? "这条待办"
@@ -477,6 +664,98 @@ struct EntryDetailView: View {
             message: "它可能已经被删除，或者同步还没完成。返回列表看看别的记录。"
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - 只读态（回收站）
+
+    /// 底部动作区：`彻底删除` + `恢复`。
+    ///
+    /// 视觉权重：`恢复` 是实心主按钮（从回收站进来的人，十个里有九个是想找回），
+    /// `彻底删除` 是红色描边（破坏性但不常用）。两个都占满宽度的一半，
+    /// 避免"恢复"被挤成一个小按钮、而"彻底删除"变成默认动作。
+    private var readOnlyBar: some View {
+        VStack(spacing: 0) {
+            Divider()
+                .opacity(0.4)
+
+            HStack(spacing: Theme.Spacing.sm) {
+                Button(role: .destructive) {
+                    showsPurgeConfirmation = true
+                } label: {
+                    Text("彻底删除")
+                        .font(Theme.Typography.headline)
+                        .frame(maxWidth: .infinity, minHeight: Theme.minimumTapSize)
+                }
+                .buttonStyle(.bordered)
+                .tint(Theme.Semantic.danger)
+                .accessibilityIdentifier("detail.purge")
+
+                Button {
+                    restoreFromTrash()
+                } label: {
+                    Text("恢复")
+                        .font(Theme.Typography.headline)
+                        .frame(maxWidth: .infinity, minHeight: Theme.minimumTapSize)
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("detail.restore")
+            }
+            .padding(.horizontal, Theme.Spacing.md)
+            .padding(.vertical, Theme.Spacing.xs)
+        }
+        .background(.bar)
+    }
+
+    /// 从回收站恢复这笔账。
+    ///
+    /// 全部交给 `TrashService.restore`（它会 `unmarkDeleted` + `unsuppress`），
+    /// 本页只负责"告诉上一页结果"和"退出本页"——不在视图层补写任何字段，
+    /// 否则恢复出来的账目和删除前就不一定一致了（PRD 6.3-1）。
+    private func restoreFromTrash() {
+        do {
+            try environment.trash.restore(entryID)
+            onReadOnlyResult?("已恢复")
+            dismiss()
+        } catch {
+            errorMessage = "恢复失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 彻底删除这笔账（不可恢复，调用前已二次确认）。
+    private func purgeFromTrash() {
+        do {
+            try environment.trash.purge(entryID)
+            onReadOnlyResult?("已彻底删除")
+            dismiss()
+        } catch {
+            errorMessage = "彻底删除失败：\(error.localizedDescription)"
+        }
+    }
+
+    // MARK: - 存为模板（F-ACC-14）
+
+    /// 默认模板名：备注 → 备注为空则分类名（PRD 5.3-3）。
+    ///
+    /// 这两句与 `TemplateService.makeFrom` 内部的兜底逻辑一致，但**不是重复**：
+    /// 服务用的是"传进来的名字为空才兜底"，而弹窗需要**先**显示一个可编辑的默认值。
+    /// 用户直接点保存时走的是这里算出来的名字，两边结果相同。
+    private func templateDefaultName(_ model: EntryDetailModel) -> String {
+        let note = model.note.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !note.isEmpty { return note }
+        return model.categoryName
+    }
+
+    /// 弹窗里那句"会存下什么"。
+    private func templateSummary(_ model: EntryDetailModel) -> String {
+        var parts: [String] = [model.type.displayName]
+        parts.append(model.amount.conciseText)
+        parts.append(model.categoryName)
+        parts.append(model.accountText)
+        let note = model.note.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !note.isEmpty {
+            parts.append("备注「\(note)」")
+        }
+        return parts.joined(separator: " · ")
     }
 
     // MARK: - 删除
@@ -495,7 +774,7 @@ struct EntryDetailView: View {
     private func performSoftDelete() {
         Task {
             guard let token = await environment.ledger.delete(id: entryID) else {
-                errorMessage = "删除失败，这笔账可能已经不存在了"
+                errorMessage = "删除失败：这笔账可能已经不存在了"
                 return
             }
             undoToken = token
@@ -516,22 +795,38 @@ struct EntryDetailView: View {
     }
 
     /// A 分支：软删 + 把该周期写进抑制表；`nextBillingDay` 不动。可 3 秒撤销。
+    ///
+    /// 两个入口共用这一条实现：工具栏「删除」→「只删除这笔账」，以及待确认行的
+    /// 「不是这笔」（V1.1 F-SUB-13）。它们的语义本来就是同一件事
+    /// （"这一期我不认，别再补回来"），写成两份迟早会在抑制表的处理上分叉。
+    ///
+    /// 实现走 `SubscriptionService.denyEntry(id:)` 而不是在这里自己拼
+    /// `ledger.delete` + `subscription.suppress`：软删与抑制必须原子地一起发生，
+    /// 顺序错了（先抑制后软删）会在中途失败时留下"账目还在、周期已被抑制"的死局。
     private func deleteAndSuppress() {
         Task {
-            guard let model else { return }
-            guard let token = await environment.ledger.delete(id: entryID) else {
-                errorMessage = "删除失败，这笔账可能已经不存在了"
-                return
+            do {
+                guard let token = try environment.subscription.denyEntry(id: entryID) else {
+                    errorMessage = "删除失败：这笔账可能已经不存在了"
+                    return
+                }
+                undoToken = token
+                startUndoTimer()
+            } catch {
+                errorMessage = "删除失败：\(error.localizedDescription)"
             }
-            undoToken = token
+        }
+    }
 
-            // 把周期写进抑制表：即使这条软删记录将来被硬删，扫描也不会把它补回来
-            if let cycleKey = model.snapshot.sourceCycleKey,
-               let subscriptionID = model.snapshot.sourceRefID {
-                _ = try? environment.subscription.suppress(cycleKey: cycleKey, of: subscriptionID)
-            }
-
-            startUndoTimer()
+    /// 「这是对的」（V1.1 F-SUB-13）：`pending` → `confirmed`，只改确认状态。
+    private func confirmPendingEntry() {
+        do {
+            // 返回值 `false` 表示"它已经不是待确认了"（比如在别的页面确认过）——
+            // 这不是错误，重读一次让它从界面上消失即可。
+            _ = try environment.ledger.confirm(id: entryID)
+            load()
+        } catch {
+            errorMessage = "确认失败：\(error.localizedDescription)"
         }
     }
 
@@ -546,7 +841,7 @@ struct EntryDetailView: View {
     private func deleteAndRevert() {
         guard let model else { return }
         guard environment.ledger.hardDelete(id: entryID) else {
-            errorMessage = "删除失败，这笔账可能已经不存在了"
+            errorMessage = "删除失败：这笔账可能已经不存在了"
             return
         }
         if let cycleKey = model.snapshot.sourceCycleKey,
@@ -569,6 +864,7 @@ struct EntryDetailView: View {
            token.snapshot.source == .subscription {
             _ = try? environment.subscription.unsuppress(cycleKey: cycleKey, of: subscriptionID)
         }
+        deniedAsPending = false
         undoToken = nil
         load()
     }

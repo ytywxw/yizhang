@@ -239,6 +239,91 @@ final class EntryFilterTests: XCTestCase {
         XCTAssertTrue(filter.keyword.isEmpty)
     }
 
+    // MARK: - 第七维：待确认（V1.1 F-SUB-13）
+
+    func testPendingOnlyKeepsOnlyPendingItems() {
+        let pending = sample(day: 20261120, isPending: true)
+        let confirmed = sample(day: 20261119, isPending: false)
+        var filter = EntryFilter()
+        filter.pendingOnly = true
+
+        XCTAssertTrue(filter.isActive)
+        XCTAssertEqual(filter.activeDimensionCount, 1)
+        XCTAssertEqual(filter.apply([pending, confirmed], today: today).map(\.id), [pending.id])
+    }
+
+    func testPendingOnlyDefaultsToOff() {
+        // 默认 `false` 是硬约束：任何既有调用方（首页 / 搜索 / 订阅页）都不该
+        // 因为新增了一个维度而突然开始过滤数据。
+        let filter = EntryFilter()
+        XCTAssertFalse(filter.pendingOnly)
+        XCTAssertFalse(filter.isActive)
+        XCTAssertEqual(EntryFilter().activeDimensionCount, 0)
+    }
+
+    func testPendingChipHasStableIDAndTitleAndCanBeRemoved() {
+        var filter = EntryFilter()
+        filter.pendingOnly = true
+
+        let chips = filter.chips()
+        XCTAssertEqual(chips.count, 1)
+        XCTAssertEqual(chips.first?.id, EntryFilter.chipIDPending)
+        XCTAssertEqual(chips.first?.title, "待确认")
+
+        filter.removeChip(id: EntryFilter.chipIDPending)
+        XCTAssertFalse(filter.pendingOnly)
+        XCTAssertFalse(filter.isActive)
+    }
+
+    func testClearAllResetsPendingOnly() {
+        var filter = EntryFilter()
+        filter.pendingOnly = true
+        XCTAssertTrue(filter.isActive)
+
+        filter.clearAll()
+        XCTAssertFalse(filter.pendingOnly)
+        XCTAssertEqual(filter, EntryFilter())
+    }
+
+    func testPendingOnlyCombinesWithOtherDimensions() {
+        let target = sample(day: 20261120, categoryID: food, isPending: true)
+        let otherPending = sample(day: 20261118, isPending: true)
+
+        var filter = EntryFilter()
+        filter.pendingOnly = true
+        filter.categoryIDs = [food]
+
+        XCTAssertEqual(filter.activeDimensionCount, 2)
+        XCTAssertEqual(filter.apply([target, otherPending], today: today).map(\.id), [target.id])
+    }
+
+    /// 三维叠加：类型 + 待确认 + 来源。
+    ///
+    /// 这三个维度在 `matches` 里是三条**独立的 `if`**，单独测各自都能过。
+    /// 但如果谁把其中一条改成 `else if`（"看起来更省一次判断"的写法），
+    /// 单维用例仍全绿，叠加时却会放过本该被滤掉的行——只有叠加用例抓得住。
+    func testPendingOnlyCombinesWithTypeAndSource() {
+        let target = sample(day: 20261120, source: .subscription, isPending: true)
+        let wrongType = sample(day: 20261120, type: .income, source: .subscription, isPending: true)
+        let wrongSource = sample(day: 20261120, source: .manual, isPending: true)
+        let wrongPending = sample(day: 20261120, source: .subscription, isPending: false)
+
+        var filter = EntryFilter()
+        filter.types = [.expense]
+        filter.sources = [.subscription]
+        filter.pendingOnly = true
+
+        XCTAssertEqual(
+            filter.activeDimensionCount, 3,
+            "三个维度都要计进 chips 的「筛选 (3)」——少算一个，用户就不知道自己滤了什么"
+        )
+        XCTAssertEqual(
+            filter.apply([target, wrongType, wrongSource, wrongPending], today: today).map(\.id),
+            [target.id],
+            "命中集合必须是三者交集：类型不符、来源不符、已确认，各有一条反例"
+        )
+    }
+
     // MARK: - 夹具
 
     /// 一个最小的可筛选对象（Domain 层纯值类型，不需要 ModelContainer）。
@@ -250,6 +335,9 @@ final class EntryFilterTests: XCTestCase {
         var categoryID: UUID?
         var accountIDs: Set<UUID> = []
         var note: String = ""
+        /// 第七维「待确认」（V1.1 F-SUB-13）。默认 `false`，所以既有用例的
+        /// 语义完全不变；只有需要断言 `pendingOnly` 的用例才显式传 `true`。
+        var isPending: Bool = false
     }
 
     private func sample(
@@ -258,7 +346,8 @@ final class EntryFilterTests: XCTestCase {
         source: EntrySource = .manual,
         categoryID: UUID? = nil,
         accountIDs: Set<UUID> = [],
-        note: String = ""
+        note: String = "",
+        isPending: Bool = false
     ) -> Sample {
         Sample(
             id: UUID(),
@@ -267,7 +356,8 @@ final class EntryFilterTests: XCTestCase {
             occurredDay: day,
             categoryID: categoryID,
             accountIDs: accountIDs,
-            note: note
+            note: note,
+            isPending: isPending
         )
     }
 }

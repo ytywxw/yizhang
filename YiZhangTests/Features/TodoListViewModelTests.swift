@@ -92,7 +92,7 @@ final class TodoListViewModelTests: XCTestCase {
         try sut.create(title: "已完成 2", dueDay: 20261120)
         try sut.create(title: "还没做", dueDay: 20261121)
 
-        var viewModel = sut.listViewModel(today: today)
+        let viewModel = sut.listViewModel(today: today)
         for row in viewModel.groups.first(where: { $0.kind == .today })?.rows ?? [] where row.title.hasPrefix("已完成") {
             _ = viewModel.complete(id: row.id)
         }
@@ -108,7 +108,17 @@ final class TodoListViewModelTests: XCTestCase {
         XCTAssertTrue(completed.rows.allSatisfy(\.isDone), "已完成的行要带 isDone（UI 画删除线）")
 
         viewModel.toggleCompletedCollapsed()
-        XCTAssertTrue(viewModel.visibleGroups.contains { $0.kind == .done })
+        XCTAssertFalse(
+            viewModel.visibleGroups.contains { $0.kind == .done },
+            "展开也不能进 visibleGroups：行由折叠头自己画，进来就会重复渲染"
+        )
+
+        // 视图层同时读这两处，合起来就是最终渲染的行集合，不许有重复 id
+        let renderedIDs = viewModel.visibleGroups.flatMap { $0.rows.map(\.id) }
+            + (viewModel.completedGroup?.rows.map(\.id) ?? [])
+        XCTAssertEqual(renderedIDs.count, Set(renderedIDs).count, "同一条待办只能被渲染一次")
+        XCTAssertEqual(viewModel.completedGroup?.rows.count, 2, "展开后两行仍要从折叠头取到")
+        XCTAssertEqual(viewModel.groups.count, viewModel.visibleGroups.count + 1, "只多出「已完成」这一组")
     }
 
     // MARK: - ④⑤ 订阅派生项
